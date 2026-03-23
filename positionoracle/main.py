@@ -479,13 +479,13 @@ async def register_begin(
     """Begin passkey registration ceremony."""
     creds = auth.load_credentials(settings.data_dir)
 
-    # First registration requires setup token
-    if not creds:
-        if setup_token != settings.setup_token:
-            raise HTTPException(status_code=403, detail="Invalid setup token")
-    else:
-        # Subsequent registrations require active session
-        _require_auth(request)
+    # Allow registration if: valid setup token OR active session
+    has_valid_token = setup_token == settings.setup_token
+    cookie = request.cookies.get(_COOKIE_NAME)
+    has_session = _verify_session(cookie)
+
+    if not has_valid_token and not has_session:
+        raise HTTPException(status_code=403, detail="Invalid setup token or not authenticated")
 
     options_json, challenge_token = auth.begin_registration(
         rp_id=settings.rp_id,

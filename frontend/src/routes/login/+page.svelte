@@ -97,9 +97,12 @@
 			<hr />
 			<p class="muted">Or register a new passkey</p>
 			<div class="form-group">
+				<input type="text" bind:value={setupToken} placeholder="Setup token" />
+			</div>
+			<div class="form-group">
 				<input type="text" bind:value={keyName} placeholder="Key name (e.g. MacBook)" />
 			</div>
-			<button class="btn btn-secondary" onclick={handleRegister} disabled={working}>
+			<button class="btn btn-secondary" onclick={handleRegister} disabled={working || !setupToken}>
 				Register New Key
 			</button>
 		{:else}
