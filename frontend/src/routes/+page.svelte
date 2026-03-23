@@ -237,7 +237,6 @@
 				<p>No positions loaded. Import a Flex Query XML to get started.</p>
 			</div>
 		{:else}
-			{@const pd = evaluateNetDelta(portfolio.net_delta)}
 			{@const pt = evaluateNetTheta(portfolio.net_theta)}
 			{@const pv = evaluateNetVega(portfolio.net_vega)}
 			{@const pg_ = evaluateNetGamma(portfolio.net_gamma)}
@@ -245,9 +244,6 @@
 			<div class="portfolio-bar">
 				<span class="portfolio-label">Portfolio</span>
 				<div class="net-greeks">
-					<span class="greek-badge {signalClass(pd.level)}" use:tooltip={pd.reason}>
-						&Delta; {formatGreek(portfolio.net_delta, 2)}
-					</span>
 					<span class="greek-badge {signalClass(pbw.level)}" use:tooltip={pbw.reason}>
 						SPY &Delta; {formatGreek(portfolio.beta_weighted_delta, 2)}
 					</span>
