@@ -1,0 +1,34 @@
+target-version = "py314"
+line-length = 99
+
+[lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "A",      # flake8-builtins
+    "SIM",    # flake8-simplify
+    "TCH",    # flake8-type-checking
+    "RUF",    # ruff-specific rules
+    "D",      # pydocstyle
+    "ANN",    # flake8-annotations
+]
+
+ignore = [
+    "D100",   # Missing docstring in public module
+    "D104",   # Missing docstring in public package
+    "D106",   # Missing docstring in public nested class
+]
+
+[lint.pydocstyle]
+convention = "numpy"
+
+[lint.isort]
+known-first-party = ["positionoracle"]
+
+[lint.per-file-ignores]
+"tests/**" = ["D", "ANN", "S101"]

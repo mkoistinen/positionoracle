@@ -1,0 +1,12 @@
+services:
+  positionoracle:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8003:8000"
+    volumes:
+      - positionoracle_data:/app/data
+
+volumes:
+  positionoracle_data:

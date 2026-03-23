@@ -1,0 +1,39 @@
+[project]
+name = "positionoracle"
+version = "0.1.0"
+description = "Options position monitor with real-time Greeks and adjustment advice"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "ibflex>=0.14",
+    "webauthn>=2.0",
+    "python-multipart>=0.0.18",
+    "itsdangerous>=2.2",
+    "pydantic-settings>=2.7",
+    "httpx>=0.28",
+    "websockets>=15.0",
+    "aiosqlite>=0.21",
+    "scipy>=1.15",
+    "anthropic>=0.42",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-cov>=6.0",
+    "pytest-asyncio>=0.25",
+    "httpx>=0.28",
+]
+
+[tool.setuptools.packages.find]
+include = ["positionoracle*"]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
