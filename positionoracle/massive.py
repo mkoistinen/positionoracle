@@ -210,12 +210,14 @@ class StockWebSocket:
                     auth_msg = json.dumps({"action": "auth", "params": self._api_key})
                     await ws.send(auth_msg)
 
-                    # Re-subscribe on reconnect
+                    # Subscribe to second aggregates (A) and trades (T) as fallback
                     if self._subscriptions:
+                        channels = ",".join(f"A.{t}" for t in self._subscriptions)
                         sub_msg = json.dumps({
                             "action": "subscribe",
-                            "params": ",".join(f"T.{t}" for t in self._subscriptions),
+                            "params": channels,
                         })
+                        logger.info("Stock WS subscribing: %s", channels)
                         await ws.send(sub_msg)
 
                     async for raw in ws:
@@ -226,13 +228,14 @@ class StockWebSocket:
                             status = msg.get("status")
                             if status:
                                 logger.info("Stock WS status: %s — %s", status, msg.get("message", ""))
-                            if ev == "T" and self._on_trade:
+                            # A = second aggregate (close price)
+                            if ev == "A" and self._on_trade:
                                 ticker = msg.get("sym", "")
-                                price = msg.get("p", 0.0)
-                                logger.debug("Trade: %s @ %.2f", ticker, price)
-                                result = self._on_trade(ticker, price)
-                                if asyncio.iscoroutine(result):
-                                    await result
+                                price = msg.get("c", 0.0)
+                                if ticker and price:
+                                    result = self._on_trade(ticker, price)
+                                    if asyncio.iscoroutine(result):
+                                        await result
             except Exception:
                 if self._running:
                     logger.exception("Stock WebSocket error, reconnecting in 5s")
@@ -251,7 +254,7 @@ class StockWebSocket:
         if new and self._ws:
             msg = json.dumps({
                 "action": "subscribe",
-                "params": ",".join(f"T.{t}" for t in new),
+                "params": ",".join(f"A.{t}" for t in new),
             })
             await self._ws.send(msg)
 
@@ -267,7 +270,7 @@ class StockWebSocket:
         if tickers and self._ws:
             msg = json.dumps({
                 "action": "unsubscribe",
-                "params": ",".join(f"T.{t}" for t in tickers),
+                "params": ",".join(f"A.{t}" for t in tickers),
             })
             await self._ws.send(msg)
 
