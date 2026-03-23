@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _REST_BASE = "https://api.polygon.io"
-_WS_STOCKS = "wss://socket.polygon.io/stocks"
+_WS_STOCKS = "wss://delayed.polygon.io/stocks"
 _WS_OPTIONS = "wss://socket.polygon.io/options"
 
 
