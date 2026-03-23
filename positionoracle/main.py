@@ -245,11 +245,14 @@ async def _refresh_options_snapshots() -> None:
 
     r = 0.05  # Approximate risk-free rate
 
-    # Pre-fetch underlying prices for any we don't have yet
-    underlyings_needed = {
-        p.underlying for p in _positions
-        if p.underlying not in _underlying_prices or _underlying_prices[p.underlying] == 0
-    }
+    # Fetch underlying prices — always during market hours, only if missing otherwise
+    if _is_market_open():
+        underlyings_needed = {p.underlying for p in _positions}
+    else:
+        underlyings_needed = {
+            p.underlying for p in _positions
+            if p.underlying not in _underlying_prices or _underlying_prices[p.underlying] == 0
+        }
     for underlying in underlyings_needed:
         stock_snap = await massive.get_stock_snapshot(
             settings.massive_api_key, underlying, client=http_client,

@@ -204,6 +204,8 @@ class StockWebSocket:
             try:
                 async with websockets.connect(_WS_STOCKS) as ws:
                     self._ws = ws
+                    logger.info("Stock WebSocket connected")
+
                     # Authenticate
                     auth_msg = json.dumps({"action": "auth", "params": self._api_key})
                     await ws.send(auth_msg)
@@ -221,9 +223,13 @@ class StockWebSocket:
                             break
                         for msg in json.loads(raw):
                             ev = msg.get("ev")
+                            status = msg.get("status")
+                            if status:
+                                logger.info("Stock WS status: %s — %s", status, msg.get("message", ""))
                             if ev == "T" and self._on_trade:
                                 ticker = msg.get("sym", "")
                                 price = msg.get("p", 0.0)
+                                logger.debug("Trade: %s @ %.2f", ticker, price)
                                 result = self._on_trade(ticker, price)
                                 if asyncio.iscoroutine(result):
                                     await result
