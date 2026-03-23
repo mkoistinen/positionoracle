@@ -556,7 +556,7 @@
 	}
 
 	main {
-		padding: 1.5rem 2rem;
+		padding: 1.5rem 2rem 60px;
 		display: flex;
 		flex-direction: column;
 		gap: 1.5rem;
