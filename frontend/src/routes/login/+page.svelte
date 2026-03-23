@@ -32,7 +32,7 @@
 		working = true;
 
 		try {
-			const token = hasCredentials ? undefined : setupToken || undefined;
+			const token = setupToken || undefined;
 			const { options, challenge_token } = await beginRegistration(token);
 
 			const publicKeyOptions = prepareCreationOptions(options);
