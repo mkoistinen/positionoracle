@@ -117,6 +117,14 @@ async def upsert_positions(data_dir: Path, positions: list[Position]) -> int:
                     now,
                 ),
             )
+        # Remove positions no longer present in the incoming set.
+        incoming_symbols = {pos.symbol for pos in positions}
+        placeholders = ",".join("?" for _ in incoming_symbols)
+        await conn.execute(
+            f"DELETE FROM positions WHERE symbol NOT IN ({placeholders})",
+            tuple(incoming_symbols),
+        )
+
         await conn.commit()
     return len(positions)
 
