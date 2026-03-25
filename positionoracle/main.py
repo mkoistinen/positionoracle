@@ -265,20 +265,26 @@ async def _refresh_options_snapshots() -> None:
             settings.massive_api_key, underlying, client=http_client,
         )
         if stock_snap:
-            # Try prevDay close, then lastTrade price
-            prev_day = stock_snap.get("prevDay", {})
+            # Try multiple price sources in order of freshness
             last_trade = stock_snap.get("lastTrade", {})
+            minute_agg = stock_snap.get("min", {})
+            day_agg = stock_snap.get("day", {})
+            prev_day = stock_snap.get("prevDay", {})
             price = (
                 last_trade.get("p", 0)
-                or prev_day.get("c", 0)
+                or minute_agg.get("c", 0)
+                or day_agg.get("c", 0)
                 or stock_snap.get("todaysChange", 0) + prev_day.get("c", 0)
+                or prev_day.get("c", 0)
             )
             if price:
                 _underlying_prices[underlying] = price
                 logger.info(
-                    "Got stock price for %s: %.2f (lastTrade=%.2f prevDay=%.2f)",
+                    "Got stock price for %s: %.2f "
+                    "(lastTrade=%.2f min=%.2f day=%.2f prevDay=%.2f)",
                     underlying, price,
-                    last_trade.get("p", 0), prev_day.get("c", 0),
+                    last_trade.get("p", 0), minute_agg.get("c", 0),
+                    day_agg.get("c", 0), prev_day.get("c", 0),
                 )
             else:
                 logger.warning(
