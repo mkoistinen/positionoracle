@@ -328,7 +328,6 @@
 									<th>Strike</th>
 									<th>Exp</th>
 									<th>Qty</th>
-									<th>Mid</th>
 									<th>IV</th>
 									<th>&Delta;</th>
 									<th>&Theta;</th>
@@ -348,7 +347,6 @@
 										<td>{isStock ? '—' : formatPrice(pos.strike)}</td>
 										<td>{isStock ? '—' : pos.expiration}</td>
 										<td class:negative={pos.quantity < 0}>{pos.quantity}</td>
-										<td>{isStock ? '—' : (pos.option_mid != null ? formatPrice(pos.option_mid) : '—')}</td>
 										<td>{isStock ? '—' : (pos.greeks.implied_volatility * 100).toFixed(1) + '%'}</td>
 										<td class={signalClass(signals.delta.level)} use:tooltip={signals.delta.reason}>
 											{isStock ? pos.quantity : formatGreek(pos.greeks.delta)}
