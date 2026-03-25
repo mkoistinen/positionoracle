@@ -137,7 +137,10 @@ async def _on_trade(ticker: str, price: float) -> None:
     price : float
         Trade price.
     """
+    old = _underlying_prices.get(ticker, 0.0)
     _underlying_prices[ticker] = price
+    if old != price:
+        logger.debug("WS price %s: %.2f -> %.2f", ticker, old, price)
     # Recompute Greeks for positions on this underlying
     await _recompute_positions(ticker)
 
@@ -272,7 +275,11 @@ async def _refresh_options_snapshots() -> None:
             )
             if price:
                 _underlying_prices[underlying] = price
-                logger.info("Got stock price for %s: %.2f", underlying, price)
+                logger.info(
+                    "Got stock price for %s: %.2f (lastTrade=%.2f prevDay=%.2f)",
+                    underlying, price,
+                    last_trade.get("p", 0), prev_day.get("c", 0),
+                )
             else:
                 logger.warning(
                     "No usable price for %s: lastTrade=%s prevDay=%s",
