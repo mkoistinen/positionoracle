@@ -143,8 +143,9 @@ async def analyze_symbol(
             {
                 "role": "user",
                 "content": (
+                    f"Today's date is {datetime.now(tz=UTC).strftime('%B %d, %Y')}.\n\n"
                     f"Analyze my {underlying} position and tell me what to do:\n\n"
-                    f"{context}. Currently, it is {datetime.now(tz=UTC)}."
+                    f"{context}"
                 ),
             }
         ],
