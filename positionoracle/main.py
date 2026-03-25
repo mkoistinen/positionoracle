@@ -37,7 +37,11 @@ from positionoracle.ws import ConnectionManager
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("websockets").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -269,6 +273,13 @@ async def _refresh_options_snapshots() -> None:
             if price:
                 _underlying_prices[underlying] = price
                 logger.info("Got stock price for %s: %.2f", underlying, price)
+            else:
+                logger.warning(
+                    "No usable price for %s: lastTrade=%s prevDay=%s",
+                    underlying, last_trade, prev_day,
+                )
+        else:
+            logger.warning("Stock snapshot returned no data for %s", underlying)
 
     for pos in _positions:
         if pos.contract_type == ContractType.STOCK:

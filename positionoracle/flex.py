@@ -32,7 +32,10 @@ def parse_flex_xml(xml_content: str) -> list[Position]:
         logger.exception("xml.etree not available")
         return []
 
-    positions: list[Position] = []
+    # Use a dict keyed by symbol to deduplicate lot-level entries.
+    # iter("OpenPosition") recurses into nested elements, so lot-level
+    # Flex Queries can yield both summary and lot rows for the same symbol.
+    seen: dict[str, Position] = {}
 
     try:
         root = ET.fromstring(xml_content)
@@ -53,17 +56,15 @@ def parse_flex_xml(xml_content: str) -> list[Position]:
                     )
                     if not symbol or quantity == 0:
                         continue
-                    positions.append(
-                        Position(
-                            symbol=symbol,
-                            underlying=symbol,
-                            contract_type=ContractType.STOCK,
-                            strike=0.0,
-                            expiration=datetime.date.max,
-                            quantity=quantity,
-                            cost_basis=cost_basis,
-                            multiplier=1,
-                        )
+                    seen[symbol] = Position(
+                        symbol=symbol,
+                        underlying=symbol,
+                        contract_type=ContractType.STOCK,
+                        strike=0.0,
+                        expiration=datetime.date.max,
+                        quantity=quantity,
+                        cost_basis=cost_basis,
+                        multiplier=1,
                     )
                 except (ValueError, TypeError):
                     logger.exception("Failed to parse stock position: %s", symbol)
@@ -91,6 +92,9 @@ def parse_flex_xml(xml_content: str) -> list[Position]:
                 cost_basis = float(cost_basis_str)
                 multiplier = int(float(multiplier_str))
 
+                if quantity == 0:
+                    continue
+
                 # IB uses YYYYMMDD format for expiry
                 if len(expiry_str) == 8:
                     expiration = datetime.date(
@@ -101,21 +105,20 @@ def parse_flex_xml(xml_content: str) -> list[Position]:
                 else:
                     expiration = datetime.date.fromisoformat(expiry_str)
 
-                positions.append(
-                    Position(
-                        symbol=symbol,
-                        underlying=underlying,
-                        contract_type=contract_type,
-                        strike=strike,
-                        expiration=expiration,
-                        quantity=quantity,
-                        cost_basis=cost_basis,
-                        multiplier=multiplier,
-                    )
+                seen[symbol] = Position(
+                    symbol=symbol,
+                    underlying=underlying,
+                    contract_type=contract_type,
+                    strike=strike,
+                    expiration=expiration,
+                    quantity=quantity,
+                    cost_basis=cost_basis,
+                    multiplier=multiplier,
                 )
             except (ValueError, TypeError):
                 logger.exception("Failed to parse position: %s", symbol)
 
+    positions = list(seen.values())
     logger.info("Parsed %d positions from Flex Query", len(positions))
     return positions
 
