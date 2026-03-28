@@ -146,11 +146,19 @@ async def _on_trade(ticker: str, price: float) -> None:
 
 
 async def _init_position_greeks() -> None:
-    """Create placeholder PositionGreeks for any positions missing from the cache.
+    """Sync the in-memory Greeks cache with the current positions list.
 
-    Ensures positions are immediately visible on the dashboard even before
-    Massive snapshot data arrives.
+    Adds placeholders for new positions and removes entries for positions
+    that no longer exist.
     """
+    current_symbols = {pos.symbol for pos in _positions}
+
+    # Remove stale entries
+    for symbol in list(_position_greeks):
+        if symbol not in current_symbols:
+            del _position_greeks[symbol]
+
+    # Add placeholders for new positions
     for pos in _positions:
         if pos.symbol not in _position_greeks:
             greeks = Greeks(delta=1.0) if pos.contract_type == ContractType.STOCK else Greeks()
