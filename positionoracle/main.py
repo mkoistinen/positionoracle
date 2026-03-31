@@ -260,14 +260,17 @@ async def _refresh_options_snapshots() -> None:
 
     r = 0.05  # Approximate risk-free rate
 
-    # Fetch underlying prices — always during market hours, only if missing otherwise
+    # Fetch underlying prices — always during market hours, only if missing otherwise.
+    # Always include SPY for beta-weighted delta calculations.
     if _is_market_open():
-        underlyings_needed = {p.underlying for p in _positions}
+        underlyings_needed = {p.underlying for p in _positions} | {"SPY"}
     else:
         underlyings_needed = {
             p.underlying for p in _positions
             if p.underlying not in _underlying_prices or _underlying_prices[p.underlying] == 0
         }
+        if "SPY" not in _underlying_prices or _underlying_prices["SPY"] == 0:
+            underlyings_needed.add("SPY")
     for underlying in underlyings_needed:
         stock_snap = await massive.get_stock_snapshot(
             settings.massive_api_key, underlying, client=http_client,
@@ -420,7 +423,7 @@ def _serialize_summaries(summaries: dict[str, Any]) -> dict[str, Any]:
             a["level"] = a["level"].value if hasattr(a["level"], "value") else a["level"]
 
         betas = _beta_data.get("betas", {})
-        spy_price = _beta_data.get("spy_price", 0.0)
+        spy_price: float = _underlying_prices.get("SPY") or _beta_data.get("spy_price") or 0.0
         ticker_beta = betas.get(ticker, 1.0)
         u_price = _underlying_prices.get(ticker, 0.0)
         bw_delta = beta.beta_weighted_delta(
@@ -448,7 +451,7 @@ def _serialize_summaries(summaries: dict[str, Any]) -> dict[str, Any]:
         "net_theta": sum(s.net_theta for s in summaries.values()),
         "net_vega": sum(s.net_vega for s in summaries.values()),
         "beta_weighted_delta": portfolio_bw_delta,
-        "spy_price": _beta_data.get("spy_price", 0.0),
+        "spy_price": _underlying_prices.get("SPY") or _beta_data.get("spy_price") or 0.0,
     }
 
     return result
