@@ -1,6 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import * as d3 from 'd3';
+	import { select, selectAll } from 'd3-selection';
+	import { extent, max } from 'd3-array';
+	import { scaleLinear } from 'd3-scale';
+	import { area, line, curveMonotoneX } from 'd3-shape';
 	import type { GEXProfile } from './ws';
 	import { tooltip } from './tooltip';
 
@@ -23,9 +26,9 @@
 		const innerHeight = chartHeight - margin.top - margin.bottom;
 
 		// Clear previous
-		d3.select(container).selectAll('*').remove();
+		select(container).selectAll('*').remove();
 
-		const svg = d3.select(container)
+		const svg = select(container)
 			.append('svg')
 			.attr('width', width)
 			.attr('height', chartHeight);
@@ -34,13 +37,13 @@
 			.attr('transform', `translate(${margin.left},${margin.top})`);
 
 		// Scales
-		const xExtent = d3.extent(strikes, d => d.strike) as [number, number];
-		const x = d3.scaleLinear()
+		const xExtent = extent(strikes, d => d.strike) as [number, number];
+		const x = scaleLinear()
 			.domain(xExtent)
 			.range([0, innerWidth]);
 
-		const maxGex = d3.max(strikes, d => Math.max(Math.abs(d.call_gex), Math.abs(d.put_gex))) || 1;
-		const y = d3.scaleLinear()
+		const maxGex = max(strikes, d => Math.max(Math.abs(d.call_gex), Math.abs(d.put_gex))) || 1;
+		const y = scaleLinear()
 			.domain([-maxGex, maxGex])
 			.range([innerHeight, 0]);
 
@@ -53,25 +56,25 @@
 			cumulative += d.net_gex;
 			return { strike: d.strike, cum: cumulative };
 		});
-		const maxCum = d3.max(cumData, d => Math.abs(d.cum)) || 1;
-		const yCum = d3.scaleLinear()
+		const maxCum = max(cumData, d => Math.abs(d.cum)) || 1;
+		const yCum = scaleLinear()
 			.domain([-maxCum, maxCum])
 			.range([innerHeight, 0]);
 		const cumZero = yCum(0);
 
 		// Positive area (green)
-		const areaPos = d3.area<{ strike: number; cum: number }>()
+		const areaPos = area<{ strike: number; cum: number }>()
 			.x(d => x(d.strike))
 			.y0(cumZero)
 			.y1(d => d.cum > 0 ? yCum(d.cum) : cumZero)
-			.curve(d3.curveMonotoneX);
+			.curve(curveMonotoneX);
 
 		// Negative area (red)
-		const areaNeg = d3.area<{ strike: number; cum: number }>()
+		const areaNeg = area<{ strike: number; cum: number }>()
 			.x(d => x(d.strike))
 			.y0(cumZero)
 			.y1(d => d.cum < 0 ? yCum(d.cum) : cumZero)
-			.curve(d3.curveMonotoneX);
+			.curve(curveMonotoneX);
 
 		g.append('path')
 			.datum(cumData)
@@ -86,10 +89,10 @@
 			.attr('opacity', 0.15);
 
 		// Cumulative net GEX line
-		const cumLine = d3.line<{ strike: number; cum: number }>()
+		const cumLine = line<{ strike: number; cum: number }>()
 			.x(d => x(d.strike))
 			.y(d => yCum(d.cum))
-			.curve(d3.curveMonotoneX);
+			.curve(curveMonotoneX);
 
 		g.append('path')
 			.datum(cumData)
