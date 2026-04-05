@@ -113,6 +113,7 @@
 				portfolio = data.portfolio;
 				if (data.gex) {
 					gexProfiles = data.gex;
+					gexRefreshing = false;
 				}
 			}
 		});
@@ -167,12 +168,10 @@
 
 	async function handleGexRefresh() {
 		gexRefreshing = true;
-		try {
-			ws?.requestGexRefresh();
-		} finally {
-			// Give it a moment, then clear the spinner
-			setTimeout(() => { gexRefreshing = false; }, 2000);
-		}
+		ws?.requestGexRefresh();
+		// The WebSocket update will arrive with GEX data; clear spinner after
+		// a generous timeout in case the chain fetch takes a while.
+		setTimeout(() => { gexRefreshing = false; }, 30000);
 	}
 
 	function formatGreek(value: number, decimals: number = 4): string {
@@ -253,25 +252,33 @@
 				<p>No positions loaded. Import a Flex Query XML to get started.</p>
 			</div>
 		{:else}
-			{#if Object.keys(gexProfiles).length > 0}
-				<div class="market-section">
-					<div class="market-header">
-						<span class="market-label">Market GEX</span>
-						<button
-							class="btn btn-secondary btn-sm"
-							onclick={handleGexRefresh}
-							disabled={gexRefreshing}
-						>
-							{gexRefreshing ? 'Refreshing...' : 'Refresh GEX'}
-						</button>
-					</div>
+			<div class="market-section">
+				<div class="market-header">
+					<span class="market-label">Market GEX</span>
+					<button
+						class="btn btn-secondary btn-sm"
+						onclick={handleGexRefresh}
+						disabled={gexRefreshing}
+					>
+						{gexRefreshing ? 'Loading GEX...' : 'Refresh GEX'}
+					</button>
+				</div>
+				{#if Object.keys(gexProfiles).length > 0}
 					<div class="gex-grid">
 						{#each Object.entries(gexProfiles) as [ticker, profile]}
 							<GexChart {profile} />
 						{/each}
 					</div>
-				</div>
-			{/if}
+				{:else}
+					<div class="gex-empty">
+						{#if gexRefreshing}
+							<span class="gex-loading">Fetching options chain data...</span>
+						{:else}
+							<span class="gex-hint">No GEX data yet. Click "Refresh GEX" to load.</span>
+						{/if}
+					</div>
+				{/if}
+			</div>
 
 			{@const pt = evaluateNetTheta(portfolio.net_theta)}
 			{@const pv = evaluateNetVega(portfolio.net_vega)}
@@ -634,6 +641,23 @@
 		display: flex;
 		flex-direction: column;
 		gap: 0.5rem;
+	}
+
+	.gex-empty {
+		padding: 0.75rem 1rem;
+		background: #1e293b;
+		border-radius: 8px;
+		border: 1px solid #334155;
+		font-size: 0.8125rem;
+		color: #64748b;
+	}
+
+	.gex-loading {
+		color: #94a3b8;
+	}
+
+	.gex-hint {
+		color: #64748b;
 	}
 
 	.underlying-gex {
