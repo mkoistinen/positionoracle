@@ -250,6 +250,59 @@ async def _beta_loop() -> None:
             await asyncio.sleep(60)
 
 
+async def _save_gex_cache() -> None:
+    """Persist GEX profiles to the database."""
+    if not _gex_profiles:
+        return
+    import dataclasses
+
+    cache = {}
+    for ticker, profile in _gex_profiles.items():
+        cache[ticker] = {
+            "underlying": profile.underlying,
+            "spot_price": profile.spot_price,
+            "net_gex": profile.net_gex,
+            "call_wall": profile.call_wall,
+            "put_wall": profile.put_wall,
+            "flip_point": profile.flip_point,
+            "expirations": profile.expirations,
+            "fetched_at": profile.fetched_at,
+            "strikes": [dataclasses.asdict(gs) for gs in profile.strikes],
+        }
+    await db.set_setting(settings.data_dir, "gex_cache", json.dumps(cache))
+    logger.info("GEX cache saved (%d profiles)", len(cache))
+
+
+async def _load_gex_cache() -> None:
+    """Load cached GEX profiles from the database."""
+    from positionoracle.types import GEXStrike
+
+    raw = await db.get_setting(settings.data_dir, "gex_cache")
+    if not raw:
+        return
+
+    cache = json.loads(raw)
+    for ticker, data in cache.items():
+        _gex_profiles[ticker] = GEXProfile(
+            underlying=data["underlying"],
+            spot_price=data["spot_price"],
+            net_gex=data["net_gex"],
+            call_wall=data["call_wall"],
+            put_wall=data["put_wall"],
+            flip_point=data["flip_point"],
+            expirations=data.get("expirations", []),
+            fetched_at=data.get("fetched_at", ""),
+            strikes=[
+                GEXStrike(**gs) for gs in data.get("strikes", [])
+            ],
+        )
+    logger.info(
+        "Loaded cached GEX data (%d profiles, from %s)",
+        len(_gex_profiles),
+        next(iter(_gex_profiles.values())).fetched_at[:10] if _gex_profiles else "?",
+    )
+
+
 async def _refresh_gex() -> None:
     """Fetch options chain snapshots and compute GEX profiles for all underlyings."""
     global http_client
@@ -260,42 +313,51 @@ async def _refresh_gex() -> None:
     if http_client is None:
         http_client = httpx.AsyncClient(timeout=30)
 
-    underlyings = {p.underlying for p in _positions} | {"SPY"}
+    # Always include SPY; process it first so it always appears
+    others = sorted({p.underlying for p in _positions} - {"SPY"})
+    underlyings = ["SPY", *others]
 
     for underlying in underlyings:
-        spot = _underlying_prices.get(underlying, 0.0)
-        if not spot:
-            logger.warning("GEX: no spot price for %s, skipping", underlying)
-            continue
+        try:
+            spot = _underlying_prices.get(underlying, 0.0)
+            if not spot:
+                logger.warning("GEX: no spot price for %s, skipping", underlying)
+                continue
 
-        # Compute strike range from held option positions
-        option_strikes = [
-            p.strike for p in _positions
-            if p.underlying == underlying and p.contract_type != ContractType.STOCK
-        ]
+            # Compute strike range from held option positions
+            option_strikes = [
+                p.strike for p in _positions
+                if p.underlying == underlying
+                and p.contract_type != ContractType.STOCK
+            ]
 
-        strike_gte, strike_lte = gex.compute_strike_range(
-            spot, option_strikes or None,
-        )
-        logger.info(
-            "GEX: fetching chain for %s, spot=%.2f, range=%.0f-%.0f",
-            underlying, spot, strike_gte, strike_lte,
-        )
-
-        chain_data = await massive.get_options_chain_snapshot(
-            settings.massive_api_key,
-            underlying,
-            strike_gte=strike_gte,
-            strike_lte=strike_lte,
-            client=http_client,
-        )
-
-        if chain_data:
-            _gex_profiles[underlying] = gex.build_gex_profile(
-                underlying, spot, chain_data,
+            strike_gte, strike_lte = gex.compute_strike_range(
+                spot, option_strikes or None,
             )
-        else:
-            logger.warning("GEX: no chain data for %s", underlying)
+            logger.info(
+                "GEX: fetching chain for %s, spot=%.2f, range=%.0f-%.0f",
+                underlying, spot, strike_gte, strike_lte,
+            )
+
+            chain_data = await massive.get_options_chain_snapshot(
+                settings.massive_api_key,
+                underlying,
+                strike_gte=strike_gte,
+                strike_lte=strike_lte,
+                client=http_client,
+            )
+
+            if chain_data:
+                _gex_profiles[underlying] = gex.build_gex_profile(
+                    underlying, spot, chain_data,
+                )
+            else:
+                logger.warning("GEX: no chain data for %s", underlying)
+        except Exception:
+            logger.exception("GEX: error fetching chain for %s", underlying)
+
+    # Persist to DB
+    await _save_gex_cache()
 
     # Broadcast updated data
     await _recompute_positions()
@@ -588,6 +650,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     if cached:
         _beta_data = cached
         logger.info("Loaded cached betas from %s", cached.get("computed_at", "?"))
+
+    await _load_gex_cache()
 
     yield
 

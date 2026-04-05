@@ -174,6 +174,17 @@
 		setTimeout(() => { gexRefreshing = false; }, 30000);
 	}
 
+	function getLiveSpot(ticker: string): number {
+		const summary = underlyings[ticker];
+		if (summary?.positions?.[0]?.underlying_price) {
+			return summary.positions[0].underlying_price;
+		}
+		if (ticker === 'SPY' && portfolio.spy_price) {
+			return portfolio.spy_price;
+		}
+		return 0;
+	}
+
 	function formatGreek(value: number, decimals: number = 4): string {
 		return value.toFixed(decimals);
 	}
@@ -266,7 +277,7 @@
 				{#if Object.keys(gexProfiles).length > 0}
 					<div class="gex-grid">
 						{#each Object.entries(gexProfiles) as [ticker, profile]}
-							<GexChart {profile} />
+							<GexChart {profile} liveSpot={getLiveSpot(ticker)} />
 						{/each}
 					</div>
 				{:else}
@@ -354,7 +365,7 @@
 					{#if expanded[ticker]}
 					{#if gexProfiles[ticker]}
 						<div class="underlying-gex">
-							<GexChart profile={gexProfiles[ticker]} compact={true} />
+							<GexChart profile={gexProfiles[ticker]} compact={true} liveSpot={getLiveSpot(ticker)} />
 						</div>
 					{/if}
 

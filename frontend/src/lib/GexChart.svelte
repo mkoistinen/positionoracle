@@ -4,9 +4,13 @@
 	import type { GEXProfile } from './ws';
 	import { tooltip } from './tooltip';
 
-	let { profile, compact = false }: { profile: GEXProfile; compact?: boolean } = $props();
+	let { profile, compact = false, liveSpot = 0 }: { profile: GEXProfile; compact?: boolean; liveSpot?: number } = $props();
 
 	let container: HTMLDivElement;
+
+	function currentSpot(): number {
+		return liveSpot || profile.spot_price;
+	}
 
 	function render() {
 		if (!container || !profile?.strikes?.length) return;
@@ -79,10 +83,11 @@
 			.attr('stroke-width', 1);
 
 		// Spot price line
-		if (profile.spot_price >= xExtent[0] && profile.spot_price <= xExtent[1]) {
+		const spot = currentSpot();
+		if (spot >= xExtent[0] && spot <= xExtent[1]) {
 			g.append('line')
-				.attr('x1', x(profile.spot_price))
-				.attr('x2', x(profile.spot_price))
+				.attr('x1', x(spot))
+				.attr('x2', x(spot))
 				.attr('y1', 0)
 				.attr('y2', innerHeight)
 				.attr('stroke', '#e2e8f0')
@@ -168,15 +173,15 @@
 	});
 
 	$effect(() => {
-		// Re-render when profile changes
-		if (profile) render();
+		// Re-render when profile or live spot changes
+		if (profile || liveSpot) render();
 	});
 </script>
 
 <div class="gex-chart-wrapper">
 	<div class="gex-chart-header">
 		<span class="gex-ticker">{profile.underlying}</span>
-		<span class="gex-spot">{profile.spot_price.toFixed(2)}</span>
+		<span class="gex-spot">{currentSpot().toFixed(2)}</span>
 		<div class="gex-stats">
 			<span
 				class="gex-stat"
