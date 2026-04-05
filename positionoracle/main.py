@@ -317,6 +317,25 @@ async def _refresh_gex() -> None:
     others = sorted({p.underlying for p in _positions} - {"SPY"})
     underlyings = ["SPY", *others]
 
+    # Ensure we have spot prices before computing GEX
+    for underlying in underlyings:
+        if underlying not in _underlying_prices or not _underlying_prices[underlying]:
+            stock_snap = await massive.get_stock_snapshot(
+                settings.massive_api_key, underlying, client=http_client,
+            )
+            if stock_snap:
+                day_agg = stock_snap.get("day", {})
+                prev_day = stock_snap.get("prevDay", {})
+                last_trade = stock_snap.get("lastTrade", {})
+                price = (
+                    last_trade.get("p", 0)
+                    or day_agg.get("c", 0)
+                    or prev_day.get("c", 0)
+                )
+                if price:
+                    _underlying_prices[underlying] = price
+                    logger.info("GEX: got spot for %s: %.2f", underlying, price)
+
     for underlying in underlyings:
         try:
             spot = _underlying_prices.get(underlying, 0.0)
