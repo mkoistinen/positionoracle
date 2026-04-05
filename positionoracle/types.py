@@ -185,5 +185,70 @@ class CredentialRecord(TypedDict):
     registered_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class GEXStrike:
+    """GEX data for a single strike price.
+
+    Attributes
+    ----------
+    strike : float
+        Strike price.
+    call_gex : float
+        Call gamma exposure at this strike (dollar-gamma).
+    put_gex : float
+        Put gamma exposure at this strike (dollar-gamma).
+    net_gex : float
+        Net GEX (call_gex + put_gex).
+    call_oi : int
+        Total call open interest at this strike.
+    put_oi : int
+        Total put open interest at this strike.
+    """
+
+    strike: float
+    call_gex: float
+    put_gex: float
+    net_gex: float
+    call_oi: int
+    put_oi: int
+
+
+@dataclass(slots=True)
+class GEXProfile:
+    """GEX profile for an underlying across all strikes.
+
+    Attributes
+    ----------
+    underlying : str
+        Underlying ticker.
+    spot_price : float
+        Current underlying price.
+    strikes : list[GEXStrike]
+        Per-strike GEX data, sorted by strike.
+    net_gex : float
+        Total net GEX across all strikes.
+    call_wall : float
+        Strike with highest absolute call GEX (resistance).
+    put_wall : float
+        Strike with highest absolute put GEX (support).
+    flip_point : float
+        Strike where cumulative GEX flips from positive to negative.
+    expirations : list[str]
+        Expiration dates included in this profile.
+    fetched_at : str
+        ISO timestamp when data was fetched.
+    """
+
+    underlying: str
+    spot_price: float
+    strikes: list[GEXStrike] = field(default_factory=list)
+    net_gex: float = 0.0
+    call_wall: float = 0.0
+    put_wall: float = 0.0
+    flip_point: float = 0.0
+    expirations: list[str] = field(default_factory=list)
+    fetched_at: str = ""
+
+
 # Type alias for the full list of stored credentials.
 CredentialStore = list[CredentialRecord]

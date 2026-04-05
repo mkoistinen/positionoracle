@@ -1,10 +1,11 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout } from '$lib/api';
-	import { PortfolioWebSocket, type PortfolioUpdate, type PortfolioRollup, type UnderlyingSummary } from '$lib/ws';
+	import { PortfolioWebSocket, type PortfolioUpdate, type PortfolioRollup, type UnderlyingSummary, type GEXProfile } from '$lib/ws';
 	import { evaluateAll, evaluateNetDelta, evaluateNetTheta, evaluateNetVega, evaluateNetGamma, evaluateBetaWeightedDelta, signalClass } from '$lib/greek-signals';
 	import { tooltip } from '$lib/tooltip';
 	import { marked } from 'marked';
+	import GexChart from '$lib/GexChart.svelte';
 
 	let authenticated = $state(false);
 	let hasCredentials = $state(false);
@@ -14,7 +15,9 @@
 	let importMessage = $state('');
 	let lastUpdated = $state('');
 	let marketOpen = $state(false);
-	let portfolio = $state<PortfolioRollup>({ net_delta: 0, net_gamma: 0, net_theta: 0, net_vega: 0 });
+	let portfolio = $state<PortfolioRollup>({ net_delta: 0, net_gamma: 0, net_theta: 0, net_vega: 0, beta_weighted_delta: 0, spy_price: 0 });
+	let gexProfiles = $state<Record<string, GEXProfile>>({});
+	let gexRefreshing = $state(false);
 	let analyses = $state<Record<string, string>>({});
 	let analyzing = $state<Record<string, boolean>>({});
 	let analysisVisible = $state<Record<string, boolean>>({});
@@ -108,6 +111,9 @@
 				lastUpdated = data.last_updated;
 				marketOpen = data.market_open;
 				portfolio = data.portfolio;
+				if (data.gex) {
+					gexProfiles = data.gex;
+				}
 			}
 		});
 		ws.connect();
@@ -156,6 +162,16 @@
 			importMessage = `Fetch failed: ${e}`;
 		} finally {
 			fetching = false;
+		}
+	}
+
+	async function handleGexRefresh() {
+		gexRefreshing = true;
+		try {
+			ws?.requestGexRefresh();
+		} finally {
+			// Give it a moment, then clear the spinner
+			setTimeout(() => { gexRefreshing = false; }, 2000);
 		}
 	}
 
@@ -217,7 +233,7 @@
 			{/if}
 		</div>
 		<div class="header-right">
-			<button class="btn btn-secondary" onclick={handleFetchFromIB} disabled={fetching}>
+			<button class="btn btn-secondary" onclick={() => handleFetchFromIB()} disabled={fetching}>
 				{fetching ? 'Fetching...' : 'Fetch from IB'}
 			</button>
 			<button class="btn btn-ghost" onclick={handleLogout}>Logout</button>
@@ -237,6 +253,26 @@
 				<p>No positions loaded. Import a Flex Query XML to get started.</p>
 			</div>
 		{:else}
+			{#if Object.keys(gexProfiles).length > 0}
+				<div class="market-section">
+					<div class="market-header">
+						<span class="market-label">Market GEX</span>
+						<button
+							class="btn btn-secondary btn-sm"
+							onclick={handleGexRefresh}
+							disabled={gexRefreshing}
+						>
+							{gexRefreshing ? 'Refreshing...' : 'Refresh GEX'}
+						</button>
+					</div>
+					<div class="gex-grid">
+						{#each Object.entries(gexProfiles) as [ticker, profile]}
+							<GexChart {profile} />
+						{/each}
+					</div>
+				</div>
+			{/if}
+
 			{@const pt = evaluateNetTheta(portfolio.net_theta)}
 			{@const pv = evaluateNetVega(portfolio.net_vega)}
 			{@const pg_ = evaluateNetGamma(portfolio.net_gamma)}
@@ -309,6 +345,12 @@
 					</div>
 
 					{#if expanded[ticker]}
+					{#if gexProfiles[ticker]}
+						<div class="underlying-gex">
+							<GexChart profile={gexProfiles[ticker]} compact={true} />
+						</div>
+					{/if}
+
 					{#if summary.advice.length > 0}
 						<div class="advice-list">
 							{#each summary.advice as item}
@@ -564,6 +606,38 @@
 		text-align: center;
 		padding: 4rem;
 		color: #94a3b8;
+	}
+
+	.market-section {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.market-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+	}
+
+	.market-label {
+		font-size: 1.1rem;
+		font-weight: 700;
+	}
+
+	.btn-sm {
+		padding: 0.25rem 0.75rem;
+		font-size: 0.75rem;
+	}
+
+	.gex-grid {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.underlying-gex {
+		padding: 0.5rem 1.5rem;
 	}
 
 	.portfolio-bar {

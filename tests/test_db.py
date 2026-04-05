@@ -75,9 +75,9 @@ class TestDatabase:
         await upsert_positions(initialized_db, updated)
 
         loaded = await load_positions(initialized_db)
-        assert len(loaded) == 2
-        call = next(p for p in loaded if p.contract_type == ContractType.CALL)
-        assert call.quantity == 20
+        # upsert_positions replaces the full set — stale positions are removed
+        assert len(loaded) == 1
+        assert loaded[0].quantity == 20
 
     async def test_delete_position(self, initialized_db):
         await upsert_positions(initialized_db, _sample_positions())

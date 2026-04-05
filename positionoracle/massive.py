@@ -166,6 +166,83 @@ async def get_daily_bars(
 
 
 # ---------------------------------------------------------------------------
+# REST — Options chain snapshot (for GEX)
+# ---------------------------------------------------------------------------
+
+
+async def get_options_chain_snapshot(
+    api_key: str,
+    underlying: str,
+    *,
+    strike_gte: float | None = None,
+    strike_lte: float | None = None,
+    limit: int = 250,
+    client: httpx.AsyncClient | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch the full options chain snapshot for an underlying.
+
+    Paginates automatically through all results. Each contract includes
+    open interest, greeks, and contract details.
+
+    Parameters
+    ----------
+    api_key : str
+        Massive API key.
+    underlying : str
+        Underlying ticker (e.g. ``"SPY"``).
+    strike_gte : float | None
+        Minimum strike price filter.
+    strike_lte : float | None
+        Maximum strike price filter.
+    limit : int
+        Results per page (max 250).
+    client : httpx.AsyncClient | None
+        Optional shared HTTP client.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        List of option contract snapshots.
+    """
+    url = f"{_REST_BASE}/v3/snapshot/options/{underlying}"
+    params: dict[str, str] = {"apiKey": api_key, "limit": str(limit)}
+    if strike_gte is not None:
+        params["strike_price.gte"] = str(strike_gte)
+    if strike_lte is not None:
+        params["strike_price.lte"] = str(strike_lte)
+
+    close_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=60)
+
+    results: list[dict[str, Any]] = []
+    try:
+        while url:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            results.extend(data.get("results", []))
+            next_url = data.get("next_url")
+            if next_url:
+                # next_url is a full URL; just append the API key
+                url = next_url
+                params = {"apiKey": api_key}
+            else:
+                url = ""
+            logger.info(
+                "Options chain %s: fetched %d contracts so far",
+                underlying, len(results),
+            )
+    except httpx.HTTPStatusError:
+        logger.exception("Failed to fetch options chain for %s", underlying)
+    finally:
+        if close_client:
+            await client.aclose()
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # WebSocket — Real-time stock prices
 # ---------------------------------------------------------------------------
 
@@ -227,7 +304,9 @@ class StockWebSocket:
                             ev = msg.get("ev")
                             status = msg.get("status")
                             if status:
-                                logger.info("Stock WS status: %s — %s", status, msg.get("message", ""))
+                                logger.info(
+                            "Stock WS status: %s - %s", status, msg.get("message", ""),
+                        )
                             # A = second aggregate (close price)
                             if ev == "A" and self._on_trade:
                                 ticker = msg.get("sym", "")

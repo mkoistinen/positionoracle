@@ -8,6 +8,7 @@ from positionoracle.types import (
     Advice,
     AdviceLevel,
     ContractType,
+    GEXProfile,
     PortfolioSummary,
     PositionGreeks,
 )
@@ -133,9 +134,123 @@ def evaluate_position(
     return advice
 
 
+def evaluate_gex(
+    underlying: str,
+    gex_profile: GEXProfile,
+    positions: list[PositionGreeks],
+) -> list[Advice]:
+    """Generate advice based on GEX profile relative to held positions.
+
+    Parameters
+    ----------
+    underlying : str
+        Underlying ticker.
+    gex_profile : GEXProfile
+        Current GEX profile for this underlying.
+    positions : list[PositionGreeks]
+        Positions in this underlying.
+
+    Returns
+    -------
+    list[Advice]
+        GEX-related advice items.
+    """
+    advice: list[Advice] = []
+    spot = gex_profile.spot_price
+
+    if not spot or not gex_profile.strikes:
+        return advice
+
+    # Negative GEX regime — volatility amplification
+    if gex_profile.net_gex < 0:
+        advice.append(Advice(
+            level=AdviceLevel.WARNING,
+            message=(
+                f"Negative GEX regime (net {gex_profile.net_gex:,.0f}) — "
+                f"dealer hedging will amplify moves. Elevated volatility expected."
+            ),
+            position_symbol=underlying,
+            metric="gex_regime",
+            value=gex_profile.net_gex,
+            threshold=0,
+        ))
+
+    # Spot near Put Wall — support level
+    if gex_profile.put_wall:
+        put_wall_dist = (spot - gex_profile.put_wall) / spot
+        if 0 < put_wall_dist <= 0.02:
+            advice.append(Advice(
+                level=AdviceLevel.INFO,
+                message=(
+                    f"Spot ${spot:.2f} is {put_wall_dist:.1%} above "
+                    f"Put Wall at ${gex_profile.put_wall:.0f} — "
+                    f"dealer hedging provides support here."
+                ),
+                position_symbol=underlying,
+                metric="gex_put_wall",
+                value=spot,
+                threshold=gex_profile.put_wall,
+            ))
+        elif put_wall_dist <= 0:
+            advice.append(Advice(
+                level=AdviceLevel.WARNING,
+                message=(
+                    f"Spot ${spot:.2f} has breached Put Wall at "
+                    f"${gex_profile.put_wall:.0f} — support lost, "
+                    f"expect accelerated selling from dealer hedging."
+                ),
+                position_symbol=underlying,
+                metric="gex_put_wall",
+                value=spot,
+                threshold=gex_profile.put_wall,
+            ))
+
+    # Spot near Call Wall — resistance level
+    if gex_profile.call_wall:
+        call_wall_dist = (gex_profile.call_wall - spot) / spot
+        if 0 < call_wall_dist <= 0.02:
+            advice.append(Advice(
+                level=AdviceLevel.INFO,
+                message=(
+                    f"Spot ${spot:.2f} is {call_wall_dist:.1%} below "
+                    f"Call Wall at ${gex_profile.call_wall:.0f} — "
+                    f"expect resistance from dealer hedging."
+                ),
+                position_symbol=underlying,
+                metric="gex_call_wall",
+                value=spot,
+                threshold=gex_profile.call_wall,
+            ))
+
+    # Check if any held strikes are near the flip point
+    if gex_profile.flip_point:
+        for pg in positions:
+            pos = pg.position
+            if pos.contract_type == ContractType.STOCK:
+                continue
+            flip_dist = abs(pos.strike - gex_profile.flip_point) / spot
+            if flip_dist <= 0.02:
+                advice.append(Advice(
+                    level=AdviceLevel.WARNING,
+                    message=(
+                        f"{pos.contract_type.value.upper()} {pos.strike:.0f} "
+                        f"is near the GEX flip point at "
+                        f"${gex_profile.flip_point:.0f} — volatility regime "
+                        f"change zone. Delta may become unstable."
+                    ),
+                    position_symbol=pos.symbol,
+                    metric="gex_flip",
+                    value=pos.strike,
+                    threshold=gex_profile.flip_point,
+                ))
+
+    return advice
+
+
 def build_portfolio_summary(
     position_greeks: list[PositionGreeks],
     thresholds: dict[str, float],
+    gex_profiles: dict[str, GEXProfile] | None = None,
 ) -> dict[str, PortfolioSummary]:
     """Aggregate positions by underlying and generate advice.
 
@@ -145,6 +260,8 @@ def build_portfolio_summary(
         All positions with their current Greeks.
     thresholds : dict[str, float]
         Advisor threshold settings.
+    gex_profiles : dict[str, GEXProfile] | None
+        GEX profiles keyed by underlying ticker.
 
     Returns
     -------
@@ -168,5 +285,14 @@ def build_portfolio_summary(
         summary.net_vega += pg.greeks.vega * qty * mult
         summary.positions.append(pg)
         summary.advice.extend(evaluate_position(pg, thresholds))
+
+    # Add GEX-based advice
+    if gex_profiles:
+        for underlying, summary in summaries.items():
+            gex_profile = gex_profiles.get(underlying)
+            if gex_profile:
+                summary.advice.extend(
+                    evaluate_gex(underlying, gex_profile, summary.positions),
+                )
 
     return summaries

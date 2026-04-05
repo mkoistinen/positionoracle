@@ -58,12 +58,34 @@ export interface PortfolioRollup {
 	spy_price: number;
 }
 
+export interface GEXStrike {
+	strike: number;
+	call_gex: number;
+	put_gex: number;
+	net_gex: number;
+	call_oi: number;
+	put_oi: number;
+}
+
+export interface GEXProfile {
+	underlying: string;
+	spot_price: number;
+	net_gex: number;
+	call_wall: number;
+	put_wall: number;
+	flip_point: number;
+	expirations: string[];
+	fetched_at: string;
+	strikes: GEXStrike[];
+}
+
 export interface PortfolioUpdate {
 	type: string;
 	last_updated: string;
 	market_open: boolean;
 	portfolio: PortfolioRollup;
 	underlyings: Record<string, UnderlyingSummary>;
+	gex?: Record<string, GEXProfile>;
 }
 
 export class PortfolioWebSocket {
@@ -132,6 +154,12 @@ export class PortfolioWebSocket {
 	requestRefresh(): void {
 		if (this.ws?.readyState === WebSocket.OPEN) {
 			this.ws.send(JSON.stringify({ type: 'refresh' }));
+		}
+	}
+
+	requestGexRefresh(): void {
+		if (this.ws?.readyState === WebSocket.OPEN) {
+			this.ws.send(JSON.stringify({ type: 'gex_refresh' }));
 		}
 	}
 }

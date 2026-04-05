@@ -1,4 +1,5 @@
 import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -353,6 +354,7 @@ class TestMarketDataOrchestration:
         main_mod._positions.append(pos)
         main_mod._position_greeks.clear()
         main_mod._underlying_prices["AAPL"] = 155.0
+        main_mod._underlying_prices["SPY"] = 550.0
 
         snapshot = {
             "greeks": {
@@ -396,6 +398,7 @@ class TestMarketDataOrchestration:
         main_mod._positions.append(pos)
         main_mod._position_greeks.clear()
         main_mod._underlying_prices["AAPL"] = 150.0
+        main_mod._underlying_prices["SPY"] = 550.0
 
         with patch(
             "positionoracle.main.massive.get_option_contract_snapshot",
@@ -411,6 +414,7 @@ class TestMarketDataOrchestration:
         # Clean up
         main_mod._positions.clear()
         main_mod._position_greeks.clear()
+        main_mod._underlying_prices.clear()
         settings.massive_api_key = ""
 
 
@@ -455,4 +459,10 @@ class TestStopMarketData:
 class TestFrontendFallback:
     async def test_missing_frontend(self, client):
         resp = await client.get("/nonexistent")
-        assert resp.status_code == 404
+        # When the SvelteKit build exists, the SPA fallback serves index.html (200).
+        # When it doesn't, we get 404.
+        static_dir = Path(__file__).parent.parent / "frontend" / "build"
+        if (static_dir / "index.html").exists():
+            assert resp.status_code == 200
+        else:
+            assert resp.status_code == 404

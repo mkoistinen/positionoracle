@@ -21,8 +21,10 @@ For each analysis, consider:
 1. Is the position working as intended? (time decay collecting, staying OTM)
 2. Are any Greeks signaling danger? (delta approaching ITM, gamma risk near expiry, \
    vanna exposure before events)
-3. What specific action, if any, should be taken? (hold, roll, close, adjust)
-4. What is the time horizon for action? (urgent now, watch this week, monitor)
+3. What does the GEX landscape tell us? (positive/negative regime, proximity to walls \
+   and flip point, how dealer hedging flows affect position risk)
+4. What specific action, if any, should be taken? (hold, roll, close, adjust)
+5. What is the time horizon for action? (urgent now, watch this week, monitor)
 
 Be direct and specific. No generic disclaimers. Use the actual numbers provided."""
 
@@ -33,6 +35,7 @@ def _format_position_context(
     spot_price: float,
     beta: float,
     beta_weighted_delta: float,
+    gex_data: dict[str, Any] | None = None,
 ) -> str:
     """Build a context string for Claude from position data.
 
@@ -48,6 +51,8 @@ def _format_position_context(
         Beta vs SPY.
     beta_weighted_delta : float
         SPY-equivalent delta.
+    gex_data : dict[str, Any] | None
+        Serialized GEX profile for this underlying.
 
     Returns
     -------
@@ -64,8 +69,22 @@ def _format_position_context(
         f"- Net Theta: {summary['net_theta']:.2f}/day",
         f"- Net Vega: {summary['net_vega']:.2f}",
         "",
-        "### Positions",
     ]
+
+    if gex_data:
+        net_gex = gex_data.get("net_gex", 0)
+        regime = "POSITIVE (dampening)" if net_gex > 0 else "NEGATIVE (amplifying)"
+        lines.extend([
+            "### GEX Landscape",
+            f"- Net GEX: {net_gex:,.0f} ({regime})",
+            f"- Call Wall (resistance): ${gex_data.get('call_wall', 0):.0f}",
+            f"- Put Wall (support): ${gex_data.get('put_wall', 0):.0f}",
+            f"- Flip Point: ${gex_data.get('flip_point', 0):.0f}",
+            f"- Data as of: {gex_data.get('fetched_at', 'unknown')}",
+            "",
+        ])
+
+    lines.append("### Positions")
 
     for pos in summary.get("positions", []):
         g = pos.get("greeks", {})
@@ -102,6 +121,7 @@ async def analyze_symbol(
     spot_price: float,
     beta: float,
     beta_weighted_delta: float,
+    gex_data: dict[str, Any] | None = None,
 ) -> str:
     """Get Claude's analysis of a symbol's positions.
 
@@ -121,6 +141,8 @@ async def analyze_symbol(
         Beta vs SPY.
     beta_weighted_delta : float
         SPY-equivalent delta.
+    gex_data : dict[str, Any] | None
+        Serialized GEX profile for this underlying.
 
     Returns
     -------
@@ -128,7 +150,7 @@ async def analyze_symbol(
         Claude's analysis as markdown text.
     """
     context = _format_position_context(
-        underlying, summary, spot_price, beta, beta_weighted_delta,
+        underlying, summary, spot_price, beta, beta_weighted_delta, gex_data,
     )
 
     client = anthropic.AsyncAnthropic(api_key=api_key)

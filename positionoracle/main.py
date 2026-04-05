@@ -27,11 +27,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 
-from positionoracle import auth, beta, db, flex, massive
+from positionoracle import auth, beta, db, flex, gex, massive
 from positionoracle.advisor import build_portfolio_summary
 from positionoracle.config import Settings, get_settings
 from positionoracle.greeks import compute_greeks_from_massive
-from positionoracle.types import ContractType, Greeks, Position, PositionGreeks
+from positionoracle.types import ContractType, GEXProfile, Greeks, Position, PositionGreeks
 from positionoracle.ws import ConnectionManager
 
 if TYPE_CHECKING:
@@ -62,6 +62,8 @@ _positions: list[Position] = []
 _snapshot_task: asyncio.Task[None] | None = None
 _beta_task: asyncio.Task[None] | None = None
 _beta_data: dict[str, Any] = {}  # {"betas": {...}, "spy_price": ..., "computed_at": ...}
+_gex_profiles: dict[str, GEXProfile] = {}  # keyed by underlying
+_gex_task: asyncio.Task[None] | None = None
 
 _COOKIE_NAME = "po_session"
 _COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 days
@@ -190,7 +192,7 @@ async def _recompute_positions(underlying: str | None = None) -> None:
     if manager.has_connections:
         thresholds = await db.get_thresholds(settings.data_dir)
         all_pgs = list(_position_greeks.values())
-        summaries = build_portfolio_summary(all_pgs, thresholds)
+        summaries = build_portfolio_summary(all_pgs, thresholds, _gex_profiles)
         await manager.broadcast(_serialize_summaries(summaries))
 
 
@@ -245,6 +247,89 @@ async def _beta_loop() -> None:
             await asyncio.sleep(300)
         except Exception:
             logger.exception("Error refreshing betas")
+            await asyncio.sleep(60)
+
+
+async def _refresh_gex() -> None:
+    """Fetch options chain snapshots and compute GEX profiles for all underlyings."""
+    global http_client
+
+    if not _positions or not settings.massive_api_key:
+        return
+
+    if http_client is None:
+        http_client = httpx.AsyncClient(timeout=30)
+
+    underlyings = {p.underlying for p in _positions} | {"SPY"}
+
+    for underlying in underlyings:
+        spot = _underlying_prices.get(underlying, 0.0)
+        if not spot:
+            logger.warning("GEX: no spot price for %s, skipping", underlying)
+            continue
+
+        # Compute strike range from held option positions
+        option_strikes = [
+            p.strike for p in _positions
+            if p.underlying == underlying and p.contract_type != ContractType.STOCK
+        ]
+
+        strike_gte, strike_lte = gex.compute_strike_range(
+            spot, option_strikes or None,
+        )
+        logger.info(
+            "GEX: fetching chain for %s, spot=%.2f, range=%.0f-%.0f",
+            underlying, spot, strike_gte, strike_lte,
+        )
+
+        chain_data = await massive.get_options_chain_snapshot(
+            settings.massive_api_key,
+            underlying,
+            strike_gte=strike_gte,
+            strike_lte=strike_lte,
+            client=http_client,
+        )
+
+        if chain_data:
+            _gex_profiles[underlying] = gex.build_gex_profile(
+                underlying, spot, chain_data,
+            )
+        else:
+            logger.warning("GEX: no chain data for %s", underlying)
+
+    # Broadcast updated data
+    await _recompute_positions()
+
+
+async def _gex_loop() -> None:
+    """Refresh GEX data once at market open, then hold until next day."""
+    from zoneinfo import ZoneInfo
+
+    while True:
+        try:
+            et_now = datetime.datetime.now(tz=ZoneInfo("America/New_York"))
+            minutes = et_now.hour * 60 + et_now.minute
+
+            # Target: 9:45 ET (15 min after open)
+            target_minutes = 9 * 60 + 45
+
+            if et_now.weekday() < 5 and minutes >= target_minutes:
+                today = et_now.date().isoformat()
+                last_fetch = ""
+                if _gex_profiles:
+                    # Check if we already fetched today
+                    any_profile = next(iter(_gex_profiles.values()), None)
+                    if any_profile and any_profile.fetched_at:
+                        last_fetch = any_profile.fetched_at[:10]
+
+                if last_fetch != today:
+                    logger.info("GEX: daily refresh triggered")
+                    await _refresh_gex()
+
+            # Check again in 5 minutes
+            await asyncio.sleep(300)
+        except Exception:
+            logger.exception("Error in GEX loop")
             await asyncio.sleep(60)
 
 
@@ -454,6 +539,32 @@ def _serialize_summaries(summaries: dict[str, Any]) -> dict[str, Any]:
         "spy_price": _underlying_prices.get("SPY") or _beta_data.get("spy_price") or 0.0,
     }
 
+    # GEX profiles
+    if _gex_profiles:
+        result["gex"] = {}
+        for ticker, profile in _gex_profiles.items():
+            result["gex"][ticker] = {
+                "underlying": profile.underlying,
+                "spot_price": profile.spot_price,
+                "net_gex": profile.net_gex,
+                "call_wall": profile.call_wall,
+                "put_wall": profile.put_wall,
+                "flip_point": profile.flip_point,
+                "expirations": profile.expirations,
+                "fetched_at": profile.fetched_at,
+                "strikes": [
+                    {
+                        "strike": gs.strike,
+                        "call_gex": gs.call_gex,
+                        "put_gex": gs.put_gex,
+                        "net_gex": gs.net_gex,
+                        "call_oi": gs.call_oi,
+                        "put_oi": gs.put_oi,
+                    }
+                    for gs in profile.strikes
+                ],
+            }
+
     return result
 
 
@@ -465,7 +576,7 @@ def _serialize_summaries(summaries: dict[str, Any]) -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Application startup and shutdown lifecycle."""
-    global settings, _positions, stock_ws, http_client, _snapshot_task, _beta_data
+    global settings, _positions, stock_ws, http_client, _snapshot_task, _beta_data, _gex_task
 
     settings = get_settings()
     await db.init_db(settings.data_dir)
@@ -487,6 +598,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         _snapshot_task.cancel()
     if _beta_task:
         _beta_task.cancel()
+    if _gex_task:
+        _gex_task.cancel()
     if http_client:
         await http_client.aclose()
 
@@ -798,6 +911,25 @@ async def clear_all_positions(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+@app.post("/api/gex/refresh")
+async def refresh_gex(request: Request) -> JSONResponse:
+    """Manually trigger a GEX data refresh.
+
+    Returns
+    -------
+    JSONResponse
+        Status and number of profiles fetched.
+    """
+    _require_auth(request)
+
+    await _refresh_gex()
+
+    return JSONResponse({
+        "status": "ok",
+        "profiles": list(_gex_profiles.keys()),
+    })
+
+
 @app.post("/api/analyze/{underlying}")
 async def analyze_underlying(request: Request, underlying: str) -> JSONResponse:
     """Get Claude's analysis of positions for a specific underlying.
@@ -836,7 +968,7 @@ async def analyze_underlying(request: Request, underlying: str) -> JSONResponse:
 
     from positionoracle.advisor import build_portfolio_summary
 
-    summaries = build_portfolio_summary(all_pgs, thresholds)
+    summaries = build_portfolio_summary(all_pgs, thresholds, _gex_profiles)
     summary = summaries.get(underlying)
     if not summary:
         raise HTTPException(status_code=404, detail=f"No summary for {underlying}")
@@ -850,6 +982,8 @@ async def analyze_underlying(request: Request, underlying: str) -> JSONResponse:
     ticker_beta = betas.get(underlying, 1.0)
     bw_delta = summary_data.get("beta_weighted_delta", 0.0)
 
+    gex_data = serialized.get("gex", {}).get(underlying)
+
     try:
         analysis = await claude_advisor.analyze_symbol(
             api_key=fresh.anthropic_api_key,
@@ -859,6 +993,7 @@ async def analyze_underlying(request: Request, underlying: str) -> JSONResponse:
             spot_price=spot_price,
             beta=ticker_beta,
             beta_weighted_delta=bw_delta,
+            gex_data=gex_data,
         )
     except Exception as exc:
         logger.exception("Claude analysis failed for %s", underlying)
@@ -892,7 +1027,7 @@ async def websocket_endpoint(
         if _position_greeks:
             thresholds = await db.get_thresholds(settings.data_dir)
             all_pgs = list(_position_greeks.values())
-            summaries = build_portfolio_summary(all_pgs, thresholds)
+            summaries = build_portfolio_summary(all_pgs, thresholds, _gex_profiles)
             await ws.send_json(_serialize_summaries(summaries))
 
         # Keep alive and handle client messages
@@ -902,6 +1037,8 @@ async def websocket_endpoint(
 
             if msg.get("type") == "refresh":
                 await _refresh_options_snapshots()
+            elif msg.get("type") == "gex_refresh":
+                await _refresh_gex()
 
     except WebSocketDisconnect:
         pass
@@ -916,7 +1053,7 @@ async def websocket_endpoint(
 
 async def _ensure_market_data() -> None:
     """Start market data connections if not already running."""
-    global stock_ws, _snapshot_task, _beta_task
+    global stock_ws, _snapshot_task, _beta_task, _gex_task
 
     if not settings.massive_api_key or not _positions:
         logger.info(
@@ -945,10 +1082,14 @@ async def _ensure_market_data() -> None:
         logger.info("Starting beta computation task")
         _beta_task = asyncio.create_task(_beta_loop())
 
+    if _gex_task is None or _gex_task.done():
+        logger.info("Starting GEX refresh task")
+        _gex_task = asyncio.create_task(_gex_loop())
+
 
 async def _stop_market_data() -> None:
     """Stop market data connections when no clients are connected."""
-    global stock_ws, _snapshot_task, _beta_task
+    global stock_ws, _snapshot_task, _beta_task, _gex_task
 
     if stock_ws:
         await stock_ws.disconnect()
@@ -961,6 +1102,10 @@ async def _stop_market_data() -> None:
     if _beta_task:
         _beta_task.cancel()
         _beta_task = None
+
+    if _gex_task:
+        _gex_task.cancel()
+        _gex_task = None
 
     logger.info("Market data connections stopped (no active clients)")
 
