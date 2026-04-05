@@ -69,3 +69,7 @@ export async function fetchPositionsFromIB(force: boolean = false): Promise<{ im
 export async function analyzeSymbol(underlying: string): Promise<{ analysis: string }> {
 	return fetchJson(`/api/analyze/${encodeURIComponent(underlying)}`, { method: 'POST' });
 }
+
+export async function refreshGex(): Promise<{ status: string; profiles: string[] }> {
+	return fetchJson('/api/gex/refresh', { method: 'POST' });
+}

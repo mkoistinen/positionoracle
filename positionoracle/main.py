@@ -1121,7 +1121,10 @@ async def websocket_endpoint(
             if msg.get("type") == "refresh":
                 await _refresh_options_snapshots()
             elif msg.get("type") == "gex_refresh":
-                await _refresh_gex()
+                try:
+                    await _refresh_gex()
+                except Exception:
+                    logger.exception("GEX refresh failed via WebSocket")
 
     except WebSocketDisconnect:
         pass

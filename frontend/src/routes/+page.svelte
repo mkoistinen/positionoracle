@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout } from '$lib/api';
+	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout, refreshGex } from '$lib/api';
 	import { PortfolioWebSocket, type PortfolioUpdate, type PortfolioRollup, type UnderlyingSummary, type GEXProfile } from '$lib/ws';
 	import { evaluateAll, evaluateNetDelta, evaluateNetTheta, evaluateNetVega, evaluateNetGamma, evaluateBetaWeightedDelta, signalClass } from '$lib/greek-signals';
 	import { tooltip } from '$lib/tooltip';
@@ -18,6 +18,7 @@
 	let portfolio = $state<PortfolioRollup>({ net_delta: 0, net_gamma: 0, net_theta: 0, net_vega: 0, beta_weighted_delta: 0, spy_price: 0 });
 	let gexProfiles = $state<Record<string, GEXProfile>>({});
 	let gexRefreshing = $state(false);
+	let gexError = $state('');
 	let analyses = $state<Record<string, string>>({});
 	let analyzing = $state<Record<string, boolean>>({});
 	let analysisVisible = $state<Record<string, boolean>>({});
@@ -168,10 +169,16 @@
 
 	async function handleGexRefresh() {
 		gexRefreshing = true;
-		ws?.requestGexRefresh();
-		// The WebSocket update will arrive with GEX data; clear spinner after
-		// a generous timeout in case the chain fetch takes a while.
-		setTimeout(() => { gexRefreshing = false; }, 30000);
+		gexError = '';
+		try {
+			await refreshGex();
+			// The WebSocket broadcast will deliver the GEX data
+			ws?.requestRefresh();
+		} catch (e) {
+			gexError = `GEX refresh failed: ${e}`;
+		} finally {
+			gexRefreshing = false;
+		}
 	}
 
 	function getLiveSpot(ticker: string): number {
@@ -284,6 +291,8 @@
 					<div class="gex-empty">
 						{#if gexRefreshing}
 							<span class="gex-loading">Fetching options chain data...</span>
+						{:else if gexError}
+							<span class="gex-error">{gexError}</span>
 						{:else}
 							<span class="gex-hint">No GEX data yet. Click "Refresh GEX" to load.</span>
 						{/if}
@@ -669,6 +678,10 @@
 
 	.gex-hint {
 		color: #64748b;
+	}
+
+	.gex-error {
+		color: #f87171;
 	}
 
 	.underlying-gex {
