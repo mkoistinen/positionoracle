@@ -47,6 +47,58 @@
 		const barWidth = Math.max(1, (innerWidth / strikes.length) * 0.35);
 		const zero = y(0);
 
+		// Cumulative net GEX — area fill showing positive (green) vs negative (red) regions
+		let cumulative = 0;
+		const cumData = strikes.map(d => {
+			cumulative += d.net_gex;
+			return { strike: d.strike, cum: cumulative };
+		});
+		const maxCum = d3.max(cumData, d => Math.abs(d.cum)) || 1;
+		const yCum = d3.scaleLinear()
+			.domain([-maxCum, maxCum])
+			.range([innerHeight, 0]);
+		const cumZero = yCum(0);
+
+		// Positive area (green)
+		const areaPos = d3.area<{ strike: number; cum: number }>()
+			.x(d => x(d.strike))
+			.y0(cumZero)
+			.y1(d => d.cum > 0 ? yCum(d.cum) : cumZero)
+			.curve(d3.curveMonotoneX);
+
+		// Negative area (red)
+		const areaNeg = d3.area<{ strike: number; cum: number }>()
+			.x(d => x(d.strike))
+			.y0(cumZero)
+			.y1(d => d.cum < 0 ? yCum(d.cum) : cumZero)
+			.curve(d3.curveMonotoneX);
+
+		g.append('path')
+			.datum(cumData)
+			.attr('d', areaPos)
+			.attr('fill', '#4ade80')
+			.attr('opacity', 0.15);
+
+		g.append('path')
+			.datum(cumData)
+			.attr('d', areaNeg)
+			.attr('fill', '#f87171')
+			.attr('opacity', 0.15);
+
+		// Cumulative net GEX line
+		const cumLine = d3.line<{ strike: number; cum: number }>()
+			.x(d => x(d.strike))
+			.y(d => yCum(d.cum))
+			.curve(d3.curveMonotoneX);
+
+		g.append('path')
+			.datum(cumData)
+			.attr('d', cumLine)
+			.attr('fill', 'none')
+			.attr('stroke', '#c084fc')
+			.attr('stroke-width', 1.5)
+			.attr('opacity', 0.7);
+
 		// Call GEX bars (positive, above zero line)
 		g.selectAll('.bar-call')
 			.data(strikes.filter(d => d.call_gex !== 0))
