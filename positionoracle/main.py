@@ -996,21 +996,23 @@ async def clear_all_positions(request: Request) -> JSONResponse:
 
 @app.post("/api/gex/refresh")
 async def refresh_gex(request: Request) -> JSONResponse:
-    """Manually trigger a GEX data refresh.
+    """Manually trigger a GEX data refresh (runs in background).
+
+    Returns immediately. Data arrives via WebSocket when ready.
 
     Returns
     -------
     JSONResponse
-        Status and number of profiles fetched.
+        Acknowledgement that the refresh was started.
     """
     _require_auth(request)
 
-    await _refresh_gex()
+    task = asyncio.create_task(_refresh_gex())
+    task.add_done_callback(
+        lambda t: t.result() if not t.cancelled() and not t.exception() else None,
+    )
 
-    return JSONResponse({
-        "status": "ok",
-        "profiles": list(_gex_profiles.keys()),
-    })
+    return JSONResponse({"status": "started"})
 
 
 @app.post("/api/analyze/{underlying}")

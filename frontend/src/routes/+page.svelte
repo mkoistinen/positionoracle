@@ -172,11 +172,11 @@
 		gexError = '';
 		try {
 			await refreshGex();
-			// The WebSocket broadcast will deliver the GEX data
-			ws?.requestRefresh();
+			// REST returns immediately; data arrives via WebSocket.
+			// Timeout clears the spinner if something goes wrong silently.
+			setTimeout(() => { gexRefreshing = false; }, 120000);
 		} catch (e) {
 			gexError = `GEX refresh failed: ${e}`;
-		} finally {
 			gexRefreshing = false;
 		}
 	}
