@@ -64,6 +64,7 @@ _beta_task: asyncio.Task[None] | None = None
 _beta_data: dict[str, Any] = {}  # {"betas": {...}, "spy_price": ..., "computed_at": ...}
 _gex_profiles: dict[str, GEXProfile] = {}  # keyed by underlying
 _gex_task: asyncio.Task[None] | None = None
+_background_tasks: set[asyncio.Task[None]] = set()
 
 _COOKIE_NAME = "po_session"
 _COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 days
@@ -1007,10 +1008,26 @@ async def refresh_gex(request: Request) -> JSONResponse:
     """
     _require_auth(request)
 
-    task = asyncio.create_task(_refresh_gex())
-    task.add_done_callback(
-        lambda t: t.result() if not t.cancelled() and not t.exception() else None,
-    )
+    async def _gex_refresh_task() -> None:
+        try:
+            logger.info("GEX refresh: starting background task")
+            logger.info(
+                "GEX refresh: positions=%d, api_key=%s, prices=%s",
+                len(_positions),
+                bool(settings.massive_api_key),
+                list(_underlying_prices.keys()),
+            )
+            await _refresh_gex()
+            logger.info(
+                "GEX refresh: completed, profiles=%s",
+                list(_gex_profiles.keys()),
+            )
+        except Exception:
+            logger.exception("GEX refresh: background task failed")
+
+    task = asyncio.create_task(_gex_refresh_task())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return JSONResponse({"status": "started"})
 
