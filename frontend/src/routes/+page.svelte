@@ -289,11 +289,9 @@
 						{gexRefreshing ? 'Loading GEX...' : 'Refresh GEX'}
 					</button>
 				</div>
-				{#if Object.keys(gexProfiles).length > 0}
+				{#if gexProfiles['SPY']}
 					<div class="gex-grid">
-						{#each Object.entries(gexProfiles) as [ticker, profile]}
-							<GexChart {profile} liveSpot={getLiveSpot(ticker)} />
-						{/each}
+						<GexChart profile={gexProfiles['SPY']} liveSpot={getLiveSpot('SPY')} />
 					</div>
 				{:else}
 					<div class="gex-empty">

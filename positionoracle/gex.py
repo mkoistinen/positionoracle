@@ -56,6 +56,38 @@ def compute_strike_range(
     return round(strike_gte, 2), round(strike_lte, 2)
 
 
+def filter_chain_data(
+    chain_data: list[dict[str, Any]],
+    strike_gte: float,
+    strike_lte: float,
+) -> list[dict[str, Any]]:
+    """Filter chain data to contracts within the strike range.
+
+    Parameters
+    ----------
+    chain_data : list[dict[str, Any]]
+        Raw contract snapshots.
+    strike_gte : float
+        Minimum strike price.
+    strike_lte : float
+        Maximum strike price.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Filtered contracts.
+    """
+    filtered = [
+        c for c in chain_data
+        if strike_gte <= c.get("details", {}).get("strike_price", 0) <= strike_lte
+    ]
+    logger.info(
+        "Filtered chain: %d -> %d contracts (range %.0f-%.0f)",
+        len(chain_data), len(filtered), strike_gte, strike_lte,
+    )
+    return filtered
+
+
 def build_gex_profile(
     underlying: str,
     spot_price: float,

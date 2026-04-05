@@ -374,6 +374,9 @@ async def _refresh_gex() -> None:
             )
 
             if chain_data:
+                chain_data = gex.filter_chain_data(
+                    chain_data, strike_gte, strike_lte,
+                )
                 _gex_profiles[underlying] = gex.build_gex_profile(
                     underlying, spot, chain_data,
                 )
