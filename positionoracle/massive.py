@@ -178,6 +178,7 @@ async def get_options_chain_snapshot(
     strike_lte: float | None = None,
     expiration_lte: str | None = None,
     limit: int = 250,
+    max_contracts: int = 2000,
     client: httpx.AsyncClient | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch the full options chain snapshot for an underlying.
@@ -227,6 +228,16 @@ async def get_options_chain_snapshot(
             resp.raise_for_status()
             data = resp.json()
             results.extend(data.get("results", []))
+            logger.info(
+                "Options chain %s: fetched %d contracts so far",
+                underlying, len(results),
+            )
+            if len(results) >= max_contracts:
+                logger.info(
+                    "Options chain %s: hit %d contract cap, stopping",
+                    underlying, max_contracts,
+                )
+                break
             next_url = data.get("next_url")
             if next_url:
                 # next_url is a full URL; just append the API key
@@ -234,10 +245,6 @@ async def get_options_chain_snapshot(
                 params = {"apiKey": api_key}
             else:
                 url = ""
-            logger.info(
-                "Options chain %s: fetched %d contracts so far",
-                underlying, len(results),
-            )
     except httpx.HTTPStatusError:
         logger.exception("Failed to fetch options chain for %s", underlying)
     finally:

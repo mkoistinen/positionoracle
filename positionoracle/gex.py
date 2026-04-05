@@ -16,7 +16,7 @@ def compute_strike_range(
     spot_price: float,
     option_strikes: list[float] | None = None,
     pad: float = 0.5,
-    default_pct: float = 0.10,
+    default_pct: float = 0.05,
 ) -> tuple[float, float]:
     """Compute the strike range to fetch for GEX analysis.
 
