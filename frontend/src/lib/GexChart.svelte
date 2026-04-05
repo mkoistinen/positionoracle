@@ -237,6 +237,11 @@
 	<div class="gex-chart-header">
 		<span class="gex-ticker">{profile.underlying}</span>
 		<span class="gex-spot">{currentSpot().toFixed(2)}</span>
+		{#if profile.expirations?.length}
+			{@const lastExp = profile.expirations[profile.expirations.length - 1]}
+			{@const daysOut = Math.ceil((new Date(lastExp + 'T00:00:00').getTime() - Date.now()) / 86400000)}
+			<span class="gex-horizon" use:tooltip={`GEX data through ${lastExp}`}>{daysOut}d</span>
+		{/if}
 		<div class="gex-stats">
 			<span
 				class="gex-stat"
@@ -287,6 +292,12 @@
 		font-size: 0.8125rem;
 		font-family: 'SF Mono', 'Fira Code', monospace;
 		color: #94a3b8;
+	}
+
+	.gex-horizon {
+		font-size: 0.6875rem;
+		font-family: 'SF Mono', 'Fira Code', monospace;
+		color: #64748b;
 	}
 
 	.gex-stats {

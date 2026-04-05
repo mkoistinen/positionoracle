@@ -337,10 +337,8 @@ async def _refresh_gex() -> None:
                     _underlying_prices[underlying] = price
                     logger.info("GEX: got spot for %s: %.2f", underlying, price)
 
-    # Limit to expirations within 30 days — near-term gamma dominates
-    max_expiry = (
-        datetime.date.today() + datetime.timedelta(days=30)
-    ).isoformat()
+    today = datetime.date.today()
+    default_expiry = (today + datetime.timedelta(days=7)).isoformat()
 
     for underlying in underlyings:
         try:
@@ -349,12 +347,21 @@ async def _refresh_gex() -> None:
                 logger.warning("GEX: no spot price for %s, skipping", underlying)
                 continue
 
-            # Compute strike range from held option positions
-            option_strikes = [
-                p.strike for p in _positions
+            # Compute strike range and expiration horizon from held options
+            option_positions = [
+                p for p in _positions
                 if p.underlying == underlying
                 and p.contract_type != ContractType.STOCK
             ]
+            option_strikes = [p.strike for p in option_positions]
+
+            if option_positions:
+                # Match the furthest expiration of held options
+                max_expiry = max(
+                    p.expiration for p in option_positions
+                ).isoformat()
+            else:
+                max_expiry = default_expiry
 
             strike_gte, strike_lte = gex.compute_strike_range(
                 spot, option_strikes or None,
