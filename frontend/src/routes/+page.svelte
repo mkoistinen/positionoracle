@@ -173,8 +173,16 @@
 		try {
 			await refreshGex();
 			// REST returns immediately; data arrives via WebSocket.
-			// Timeout clears the spinner if something goes wrong silently.
-			setTimeout(() => { gexRefreshing = false; }, 120000);
+			// gexRefreshing stays true until WebSocket delivers GEX data
+			// (or timeout after 5 minutes as a safety net).
+			setTimeout(() => {
+				if (gexRefreshing) {
+					gexRefreshing = false;
+					if (Object.keys(gexProfiles).length === 0) {
+						gexError = 'GEX refresh timed out. Check server logs.';
+					}
+				}
+			}, 300000);
 		} catch (e) {
 			gexError = `GEX refresh failed: ${e}`;
 			gexRefreshing = false;

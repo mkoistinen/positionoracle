@@ -176,6 +176,7 @@ async def get_options_chain_snapshot(
     *,
     strike_gte: float | None = None,
     strike_lte: float | None = None,
+    expiration_lte: str | None = None,
     limit: int = 250,
     client: httpx.AsyncClient | None = None,
 ) -> list[dict[str, Any]]:
@@ -194,6 +195,8 @@ async def get_options_chain_snapshot(
         Minimum strike price filter.
     strike_lte : float | None
         Maximum strike price filter.
+    expiration_lte : str | None
+        Maximum expiration date filter (ISO format, e.g. ``"2026-05-01"``).
     limit : int
         Results per page (max 250).
     client : httpx.AsyncClient | None
@@ -210,6 +213,8 @@ async def get_options_chain_snapshot(
         params["strike_price.gte"] = str(strike_gte)
     if strike_lte is not None:
         params["strike_price.lte"] = str(strike_lte)
+    if expiration_lte is not None:
+        params["expiration_date.lte"] = expiration_lte
 
     close_client = client is None
     if client is None:

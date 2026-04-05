@@ -337,6 +337,11 @@ async def _refresh_gex() -> None:
                     _underlying_prices[underlying] = price
                     logger.info("GEX: got spot for %s: %.2f", underlying, price)
 
+    # Limit to expirations within 30 days — near-term gamma dominates
+    max_expiry = (
+        datetime.date.today() + datetime.timedelta(days=30)
+    ).isoformat()
+
     for underlying in underlyings:
         try:
             spot = _underlying_prices.get(underlying, 0.0)
@@ -355,8 +360,8 @@ async def _refresh_gex() -> None:
                 spot, option_strikes or None,
             )
             logger.info(
-                "GEX: fetching chain for %s, spot=%.2f, range=%.0f-%.0f",
-                underlying, spot, strike_gte, strike_lte,
+                "GEX: fetching chain for %s, spot=%.2f, range=%.0f-%.0f, exp<=%s",
+                underlying, spot, strike_gte, strike_lte, max_expiry,
             )
 
             chain_data = await massive.get_options_chain_snapshot(
@@ -364,6 +369,7 @@ async def _refresh_gex() -> None:
                 underlying,
                 strike_gte=strike_gte,
                 strike_lte=strike_lte,
+                expiration_lte=max_expiry,
                 client=http_client,
             )
 
