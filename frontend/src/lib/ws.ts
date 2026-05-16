@@ -82,6 +82,7 @@ export interface GEXProfile {
 export interface PortfolioUpdate {
 	type: string;
 	last_updated: string;
+	last_report_generated: string | null;
 	market_open: boolean;
 	portfolio: PortfolioRollup;
 	underlyings: Record<string, UnderlyingSummary>;

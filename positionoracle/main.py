@@ -59,6 +59,7 @@ http_client: httpx.AsyncClient | None = None
 _underlying_prices: dict[str, float] = {}
 _position_greeks: dict[str, PositionGreeks] = {}
 _positions: list[Position] = []
+_last_report_generated: str | None = None
 _snapshot_task: asyncio.Task[None] | None = None
 _beta_task: asyncio.Task[None] | None = None
 _beta_data: dict[str, Any] = {}  # {"betas": {...}, "spy_price": ..., "computed_at": ...}
@@ -588,6 +589,7 @@ def _serialize_summaries(summaries: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "type": "update",
         "last_updated": datetime.datetime.now(tz=datetime.UTC).isoformat(),
+        "last_report_generated": _last_report_generated,
         "market_open": _is_market_open(),
         "underlyings": {},
     }
@@ -883,12 +885,17 @@ async def import_positions(request: Request, file: UploadFile) -> JSONResponse:
 
     content = await file.read()
     xml_str = content.decode("utf-8")
-    positions = flex.parse_flex_xml(xml_str)
+    report = flex.parse_flex_report(xml_str)
 
-    if not positions:
+    if not report.positions:
         raise HTTPException(status_code=400, detail="No option positions found in file")
 
-    count = await db.upsert_positions(settings.data_dir, positions)
+    count = await db.upsert_positions(settings.data_dir, report.positions)
+    await db.set_setting(
+        settings.data_dir,
+        _FLEX_REPORT_DATE_KEY,
+        report.when_generated.isoformat(),
+    )
     await _reload_positions()
 
     await _init_position_greeks()
@@ -934,14 +941,19 @@ async def _reload_positions() -> None:
 
     Run after every successful IB fetch, after any DB mutation that
     might leave stale rows, and at startup. Expiration uses ET so the
-    cutoff aligns with market time, not server wall time.
+    cutoff aligns with market time, not server wall time. Also refreshes
+    ``_last_report_generated`` so the WebSocket payload reports the
+    timestamp IB stamped on the most recently imported Flex report.
     """
-    global _positions
+    global _positions, _last_report_generated
     today_et = datetime.datetime.now(tz=_ET).date()
     deleted = await db.delete_expired_positions(settings.data_dir, today_et)
     if deleted:
         logger.info("Removed %d expired option position(s)", deleted)
     _positions = await db.load_positions(settings.data_dir)
+    _last_report_generated = await db.get_setting(
+        settings.data_dir, _FLEX_REPORT_DATE_KEY,
+    )
 
 
 def _flex_response_payload(

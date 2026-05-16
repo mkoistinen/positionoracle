@@ -14,6 +14,7 @@
 	let connected = $state(false);
 	let importMessage = $state('');
 	let lastUpdated = $state('');
+	let lastReportGenerated = $state<string | null>(null);
 	let marketOpen = $state(false);
 	let portfolio = $state<PortfolioRollup>({ net_delta: 0, net_gamma: 0, net_theta: 0, net_vega: 0, beta_weighted_delta: 0, spy_price: 0 });
 	let gexProfiles = $state<Record<string, GEXProfile>>({});
@@ -110,6 +111,7 @@
 			if (data.type === 'update') {
 				underlyings = data.underlyings;
 				lastUpdated = data.last_updated;
+				lastReportGenerated = data.last_report_generated;
 				marketOpen = data.market_open;
 				portfolio = data.portfolio;
 				if (data.gex) {
@@ -134,20 +136,71 @@
 		underlyings = {};
 	}
 
-	async function handleImport(event: Event) {
-		const input = event.target as HTMLInputElement;
-		const file = input.files?.[0];
-		if (!file) return;
+	let isDragging = $state(false);
+	let importing = $state(false);
+	let dragCounter = 0;
 
+	async function importFile(file: File) {
+		if (importing) return;
+		importing = true;
 		try {
 			const result = await importPositions(file);
-			importMessage = `Imported ${result.imported} positions`;
+			importMessage = `Imported ${result.imported} positions from ${file.name}`;
 			ws?.requestRefresh();
 		} catch (e) {
 			importMessage = `Import failed: ${e}`;
+		} finally {
+			importing = false;
+		}
+	}
+
+	function dragHasFiles(event: DragEvent): boolean {
+		return !!event.dataTransfer && Array.from(event.dataTransfer.types).includes('Files');
+	}
+
+	function handleDragEnter(event: DragEvent) {
+		if (!dragHasFiles(event)) return;
+		event.preventDefault();
+		if (!authenticated) return;
+		dragCounter += 1;
+		isDragging = true;
+	}
+
+	function handleDragOver(event: DragEvent) {
+		if (!dragHasFiles(event)) return;
+		event.preventDefault();
+		if (!authenticated) return;
+		if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+	}
+
+	function handleDragLeave(event: DragEvent) {
+		if (!dragHasFiles(event)) return;
+		event.preventDefault();
+		if (!authenticated) return;
+		dragCounter = Math.max(0, dragCounter - 1);
+		if (dragCounter === 0) isDragging = false;
+	}
+
+	async function handleDrop(event: DragEvent) {
+		if (!dragHasFiles(event)) return;
+		event.preventDefault();
+		if (!authenticated) return;
+		dragCounter = 0;
+		isDragging = false;
+
+		const file = event.dataTransfer?.files?.[0];
+		if (!file) return;
+
+		const looksLikeXml =
+			file.type === 'text/xml' ||
+			file.type === 'application/xml' ||
+			file.name.toLowerCase().endsWith('.xml');
+		if (!looksLikeXml) {
+			importMessage = `Import failed: "${file.name}" doesn't look like an XML file`;
+			return;
 		}
 
-		input.value = '';
+		await importFile(file);
 	}
 
 	let fetching = $state(false);
@@ -242,7 +295,37 @@
 			timeZoneName: 'short',
 		});
 	}
+
+	function formatReportTimestamp(iso: string | null): string {
+		if (!iso) return '';
+		const d = new Date(iso);
+		return d.toLocaleString('en-US', {
+			year: 'numeric',
+			month: 'short',
+			day: 'numeric',
+			hour: '2-digit',
+			minute: '2-digit',
+			timeZoneName: 'short',
+		});
+	}
 </script>
+
+<svelte:window
+	ondragenter={handleDragEnter}
+	ondragover={handleDragOver}
+	ondragleave={handleDragLeave}
+	ondrop={handleDrop}
+/>
+
+{#if isDragging}
+	<div class="drop-overlay">
+		<div class="drop-overlay-inner">
+			<div class="drop-icon">⬇</div>
+			<div class="drop-title">Drop Flex Query XML to import</div>
+			<div class="drop-subtitle">Releases the file and replaces your position set</div>
+		</div>
+	</div>
+{/if}
 
 {#if loading}
 	<div class="center">Loading...</div>
@@ -477,6 +560,12 @@
 				</section>
 			{/each}
 		{/if}
+
+		{#if lastReportGenerated}
+			<div class="last-import">
+				Report generated: {formatReportTimestamp(lastReportGenerated)}
+			</div>
+		{/if}
 	</main>
 {/if}
 
@@ -610,6 +699,53 @@
 		font-size: 0.75rem;
 		color: #64748b;
 		font-family: 'SF Mono', 'Fira Code', monospace;
+	}
+
+	.last-import {
+		text-align: center;
+		color: #64748b;
+		font-size: 0.8125rem;
+		padding: 1.25rem 0 0.5rem;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.drop-overlay {
+		position: fixed;
+		inset: 0;
+		z-index: 1000;
+		background: rgba(15, 23, 42, 0.85);
+		backdrop-filter: blur(2px);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		pointer-events: none;
+	}
+
+	.drop-overlay-inner {
+		border: 2px dashed #60a5fa;
+		border-radius: 1rem;
+		padding: 3rem 5rem;
+		background: rgba(30, 58, 95, 0.6);
+		text-align: center;
+		color: #dbeafe;
+	}
+
+	.drop-icon {
+		font-size: 3rem;
+		line-height: 1;
+		margin-bottom: 0.75rem;
+		color: #60a5fa;
+	}
+
+	.drop-title {
+		font-size: 1.25rem;
+		font-weight: 600;
+		margin-bottom: 0.25rem;
+	}
+
+	.drop-subtitle {
+		font-size: 0.875rem;
+		color: #93c5fd;
 	}
 
 	.import-message {
