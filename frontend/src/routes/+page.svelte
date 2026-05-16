@@ -499,7 +499,7 @@
 				</div>
 			</div>
 
-			{#each Object.entries(underlyings) as [ticker, summary]}
+			{#each Object.entries(underlyings).sort(([a], [b]) => a.localeCompare(b)) as [ticker, summary]}
 				{@const nd = evaluateNetDelta(summary.net_delta)}
 				{@const nbw = evaluateBetaWeightedDelta(summary.beta_weighted_delta, summary.beta)}
 				{@const nt = evaluateNetTheta(summary.net_theta)}
