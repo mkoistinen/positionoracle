@@ -49,6 +49,30 @@
 		}
 	}
 
+	type Tab = 'greeks' | 'washsale';
+	const TAB_KEY = 'po_active_tab';
+
+	function loadActiveTab(): Tab {
+		try {
+			const raw = localStorage.getItem(TAB_KEY);
+			if (raw === 'greeks' || raw === 'washsale') return raw;
+		} catch {
+			// ignore
+		}
+		return 'greeks';
+	}
+
+	let activeTab = $state<Tab>(loadActiveTab());
+
+	function setActiveTab(tab: Tab) {
+		activeTab = tab;
+		try {
+			localStorage.setItem(TAB_KEY, tab);
+		} catch {
+			// ignore
+		}
+	}
+
 	const EXPANDED_KEY = 'po_expanded';
 
 	function loadExpanded(): Record<string, boolean> {
@@ -371,6 +395,28 @@
 		</div>
 	{/if}
 
+	<div class="tabs" role="tablist" aria-label="App sections">
+		<button
+			class="tab"
+			class:tab-active={activeTab === 'greeks'}
+			role="tab"
+			aria-selected={activeTab === 'greeks'}
+			onclick={() => setActiveTab('greeks')}
+		>
+			Greeks
+		</button>
+		<button
+			class="tab"
+			class:tab-active={activeTab === 'washsale'}
+			role="tab"
+			aria-selected={activeTab === 'washsale'}
+			onclick={() => setActiveTab('washsale')}
+		>
+			WashSale
+		</button>
+	</div>
+
+	{#if activeTab === 'greeks'}
 	<main>
 		{#if Object.keys(underlyings).length === 0}
 			<div class="empty">
@@ -567,6 +613,15 @@
 			</div>
 		{/if}
 	</main>
+	{:else if activeTab === 'washsale'}
+	<main class="washsale-stub">
+		<div class="empty">
+			<h2>WashSale</h2>
+			<p>30-day blacklist of symbols with recent realized losses.</p>
+			<p class="muted">Coming in the next pass — this tab will surface the wash-sale tracker that currently lives in <code>washwatch</code>, fed by the same Flex Query as the Greeks tab.</p>
+		</div>
+	</main>
+	{/if}
 {/if}
 
 <style>
@@ -778,6 +833,58 @@
 	.import-message-close:hover {
 		background: #3b6998;
 		border-color: #93c5fd;
+	}
+
+	.tabs {
+		display: flex;
+		gap: 0.25rem;
+		padding: 0 2rem;
+		border-bottom: 1px solid #1e293b;
+		background: #0f172a;
+	}
+
+	.tab {
+		background: transparent;
+		border: none;
+		border-bottom: 2px solid transparent;
+		color: #94a3b8;
+		padding: 0.75rem 1rem;
+		font-size: 0.875rem;
+		font-weight: 600;
+		cursor: pointer;
+		transition: color 0.15s, border-color 0.15s, background 0.15s;
+		margin-bottom: -1px;
+	}
+
+	.tab:hover {
+		color: #e2e8f0;
+		background: #111c2e;
+	}
+
+	.tab-active {
+		color: #93c5fd;
+		border-bottom-color: #3b82f6;
+	}
+
+	.tab-active:hover {
+		color: #93c5fd;
+		background: transparent;
+	}
+
+	.washsale-stub .empty {
+		max-width: 36rem;
+	}
+
+	.washsale-stub .empty h2 {
+		margin: 0 0 0.5rem;
+		color: #e2e8f0;
+	}
+
+	.washsale-stub .empty code {
+		background: #1e293b;
+		padding: 0.1rem 0.35rem;
+		border-radius: 0.25rem;
+		font-size: 0.85em;
 	}
 
 	main {
