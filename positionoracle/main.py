@@ -7,10 +7,10 @@ import dataclasses
 import datetime
 import json
 import logging
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import (
@@ -68,6 +68,16 @@ _background_tasks: set[asyncio.Task[None]] = set()
 
 _COOKIE_NAME = "po_session"
 _COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 days
+
+_ET = ZoneInfo("America/New_York")
+_FLEX_REPORT_DATE_KEY = "flex_last_report_generated"
+_FLEX_LAST_ATTEMPT_KEY = "flex_last_fetch_attempt"
+# IB publishes EOD Flex reports after market close. We assume today's
+# report becomes available by 17:00 ET; before that, the previous
+# business day's report is the latest expected.
+_FLEX_PUBLISH_HOUR_ET = 17
+# After a failed IB fetch, hold off retries for this many seconds.
+_FLEX_FAILURE_BACKOFF = 30 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -400,22 +410,21 @@ async def _refresh_gex() -> None:
 
 
 async def _gex_loop() -> None:
-    """Refresh GEX data once at market open, then hold until next day."""
+    """Refresh GEX data once per trading day.
+
+    Fetches as soon as it detects no data for today on a weekday,
+    whether that's at 9:45 ET or any time after.
+    """
     from zoneinfo import ZoneInfo
 
     while True:
         try:
             et_now = datetime.datetime.now(tz=ZoneInfo("America/New_York"))
-            minutes = et_now.hour * 60 + et_now.minute
 
-            # Target: 9:45 ET (15 min after open)
-            target_minutes = 9 * 60 + 45
-
-            if et_now.weekday() < 5 and minutes >= target_minutes:
+            if et_now.weekday() < 5:
                 today = et_now.date().isoformat()
                 last_fetch = ""
                 if _gex_profiles:
-                    # Check if we already fetched today
                     any_profile = next(iter(_gex_profiles.values()), None)
                     if any_profile and any_profile.fetched_at:
                         last_fetch = any_profile.fetched_at[:10]
@@ -678,7 +687,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     settings = get_settings()
     await db.init_db(settings.data_dir)
-    _positions = await db.load_positions(settings.data_dir)
+    await _reload_positions()
     logger.info("Loaded %d positions from database", len(_positions))
 
     # Load cached betas
@@ -880,7 +889,7 @@ async def import_positions(request: Request, file: UploadFile) -> JSONResponse:
         raise HTTPException(status_code=400, detail="No option positions found in file")
 
     count = await db.upsert_positions(settings.data_dir, positions)
-    _positions = await db.load_positions(settings.data_dir)
+    await _reload_positions()
 
     await _init_position_greeks()
     await _recompute_positions()
@@ -889,8 +898,71 @@ async def import_positions(request: Request, file: UploadFile) -> JSONResponse:
     return JSONResponse({"status": "ok", "imported": count})
 
 
-_FLEX_CACHE_TTL = 15 * 60  # 15 minutes
-_last_flex_fetch: float = 0.0
+def _previous_business_day(d: datetime.date) -> datetime.date:
+    """Return the most recent weekday strictly before ``d``."""
+    prev = d - datetime.timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= datetime.timedelta(days=1)
+    return prev
+
+
+def _expected_latest_report_date(now_et: datetime.datetime) -> datetime.date:
+    """Most recent ET date for which IB should have a published Flex report.
+
+    IB publishes EOD reports after market close. Before ``_FLEX_PUBLISH_HOUR_ET``
+    on a weekday, today's report isn't ready yet, so the latest expected
+    report is the previous business day. On weekends, the latest is Friday.
+
+    Parameters
+    ----------
+    now_et : datetime.datetime
+        Current time in market timezone.
+
+    Returns
+    -------
+    datetime.date
+        The expected date of the most recent published report.
+    """
+    today = now_et.date()
+    if today.weekday() >= 5 or now_et.hour < _FLEX_PUBLISH_HOUR_ET:
+        return _previous_business_day(today)
+    return today
+
+
+async def _reload_positions() -> None:
+    """Delete expired options and refresh ``_positions`` from the DB.
+
+    Run after every successful IB fetch, after any DB mutation that
+    might leave stale rows, and at startup. Expiration uses ET so the
+    cutoff aligns with market time, not server wall time.
+    """
+    global _positions
+    today_et = datetime.datetime.now(tz=_ET).date()
+    deleted = await db.delete_expired_positions(settings.data_dir, today_et)
+    if deleted:
+        logger.info("Removed %d expired option position(s)", deleted)
+    _positions = await db.load_positions(settings.data_dir)
+
+
+def _flex_response_payload(
+    *,
+    imported: int,
+    cached: bool,
+    stale: bool,
+    report_generated_at: str | None,
+    last_attempt_at: str | None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Build a uniform response body for ``/api/positions/fetch``."""
+    return {
+        "status": "ok",
+        "imported": imported,
+        "cached": cached,
+        "stale": stale,
+        "report_generated_at": report_generated_at,
+        "last_attempt_at": last_attempt_at,
+        "error": error,
+    }
 
 
 @app.post("/api/positions/fetch")
@@ -900,9 +972,16 @@ async def fetch_positions(
 ) -> JSONResponse:
     """Fetch positions directly from IB via Flex Query API.
 
-    Uses the configured ``FLEX_TOKEN`` and ``QUERY_ID`` to download
-    the report from IB's servers. Results are cached for 15 minutes
-    unless ``force=true`` is passed.
+    Cache behavior:
+
+    - If the cached report's date is already at or beyond the latest
+      report date IB is expected to have published, no IB call is made.
+    - If a previous fetch attempt failed recently (within the backoff
+      window), the cached positions are returned with ``stale=true``.
+    - On an IB failure with cached data available, return the cached
+      list with ``stale=true`` and ``error`` populated (status 200)
+      rather than 502 — the UI should still render the book.
+    - ``force=true`` bypasses both the date check and the backoff.
 
     Parameters
     ----------
@@ -914,22 +993,57 @@ async def fetch_positions(
     Returns
     -------
     JSONResponse
-        Import result with count of positions.
+        Status, imported count, cache/staleness metadata, and optional
+        error message.
     """
-    global _positions, _last_flex_fetch
+    global _positions
 
     _require_auth(request)
 
-    now = time.monotonic()
-    if not force and (now - _last_flex_fetch) < _FLEX_CACHE_TTL and _positions:
+    now_et = datetime.datetime.now(tz=_ET)
+    expected_report_date = _expected_latest_report_date(now_et)
+
+    cached_report_raw = await db.get_setting(settings.data_dir, _FLEX_REPORT_DATE_KEY)
+    last_attempt_raw = await db.get_setting(settings.data_dir, _FLEX_LAST_ATTEMPT_KEY)
+    cached_report_dt = (
+        datetime.datetime.fromisoformat(cached_report_raw) if cached_report_raw else None
+    )
+    last_attempt_dt = (
+        datetime.datetime.fromisoformat(last_attempt_raw) if last_attempt_raw else None
+    )
+
+    have_current_report = (
+        cached_report_dt is not None
+        and cached_report_dt.astimezone(_ET).date() >= expected_report_date
+        and bool(_positions)
+    )
+
+    if not force and have_current_report:
+        await _reload_positions()
         await _init_position_greeks()
         await _recompute_positions()
         await _ensure_market_data()
-        return JSONResponse({
-            "status": "ok",
-            "imported": len(_positions),
-            "cached": True,
-        })
+        return JSONResponse(_flex_response_payload(
+            imported=len(_positions),
+            cached=True,
+            stale=False,
+            report_generated_at=cached_report_dt.isoformat() if cached_report_dt else None,
+            last_attempt_at=last_attempt_dt.isoformat() if last_attempt_dt else None,
+        ))
+
+    in_backoff = (
+        last_attempt_dt is not None
+        and (now_et - last_attempt_dt.astimezone(_ET)).total_seconds() < _FLEX_FAILURE_BACKOFF
+    )
+    if not force and in_backoff and _positions:
+        return JSONResponse(_flex_response_payload(
+            imported=len(_positions),
+            cached=True,
+            stale=True,
+            report_generated_at=cached_report_dt.isoformat() if cached_report_dt else None,
+            last_attempt_at=last_attempt_dt.isoformat() if last_attempt_dt else None,
+            error="Recent IB fetch failed; using cached positions until backoff clears.",
+        ))
 
     if not settings.flex_token or not settings.query_id:
         raise HTTPException(
@@ -937,25 +1051,47 @@ async def fetch_positions(
             detail="FLEX_TOKEN and QUERY_ID must be configured in .env",
         )
 
+    attempt_iso = now_et.isoformat()
     try:
-        positions = await flex.fetch_positions(settings.flex_token, settings.query_id)
+        report = await flex.fetch_positions(settings.flex_token, settings.query_id)
     except Exception as exc:
         logger.exception("Failed to fetch Flex Query from IB")
+        await db.set_setting(settings.data_dir, _FLEX_LAST_ATTEMPT_KEY, attempt_iso)
+        if _positions:
+            return JSONResponse(_flex_response_payload(
+                imported=len(_positions),
+                cached=True,
+                stale=True,
+                report_generated_at=cached_report_dt.isoformat() if cached_report_dt else None,
+                last_attempt_at=attempt_iso,
+                error=f"IB Flex Query failed: {exc}",
+            ))
         raise HTTPException(status_code=502, detail=f"IB Flex Query failed: {exc}") from exc
 
-    if not positions:
+    if not report.positions:
+        await db.set_setting(settings.data_dir, _FLEX_LAST_ATTEMPT_KEY, attempt_iso)
         raise HTTPException(status_code=400, detail="No option positions found in Flex Query")
 
-    _last_flex_fetch = now
-
-    count = await db.upsert_positions(settings.data_dir, positions)
-    _positions = await db.load_positions(settings.data_dir)
+    count = await db.upsert_positions(settings.data_dir, report.positions)
+    await db.set_setting(
+        settings.data_dir,
+        _FLEX_REPORT_DATE_KEY,
+        report.when_generated.isoformat(),
+    )
+    await db.set_setting(settings.data_dir, _FLEX_LAST_ATTEMPT_KEY, attempt_iso)
+    await _reload_positions()
 
     await _init_position_greeks()
     await _recompute_positions()
     await _ensure_market_data()
 
-    return JSONResponse({"status": "ok", "imported": count})
+    return JSONResponse(_flex_response_payload(
+        imported=count,
+        cached=False,
+        stale=False,
+        report_generated_at=report.when_generated.isoformat(),
+        last_attempt_at=attempt_iso,
+    ))
 
 
 @app.get("/api/positions")

@@ -61,7 +61,16 @@ export async function importPositions(file: File): Promise<{ imported: number }>
 	});
 }
 
-export async function fetchPositionsFromIB(force: boolean = false): Promise<{ imported: number; cached?: boolean }> {
+export interface FlexFetchResult {
+	imported: number;
+	cached: boolean;
+	stale: boolean;
+	report_generated_at: string | null;
+	last_attempt_at: string | null;
+	error: string | null;
+}
+
+export async function fetchPositionsFromIB(force: boolean = false): Promise<FlexFetchResult> {
 	const params = force ? '?force=true' : '';
 	return fetchJson(`/api/positions/fetch${params}`, { method: 'POST' });
 }

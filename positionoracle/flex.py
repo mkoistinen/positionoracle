@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+from zoneinfo import ZoneInfo
 
-from positionoracle.types import ContractType, Position
+from positionoracle.types import ContractType, FlexReport, Position
 
 logger = logging.getLogger(__name__)
+
+_ET = ZoneInfo("America/New_York")
 
 
 def parse_flex_xml(xml_content: str) -> list[Position]:
@@ -123,6 +126,80 @@ def parse_flex_xml(xml_content: str) -> list[Position]:
     return positions
 
 
+def _parse_when_generated(value: str) -> datetime.datetime | None:
+    """Parse IB's ``whenGenerated`` attribute into a tz-aware ET datetime.
+
+    IB formats the value as ``YYYYMMDD;HHMMSS`` in Eastern Time. Returns
+    ``None`` if the value is missing or malformed; the caller decides
+    how to fall back.
+
+    Parameters
+    ----------
+    value : str
+        Raw attribute value from the ``<FlexStatement>`` element.
+
+    Returns
+    -------
+    datetime.datetime | None
+        Aware datetime in ``America/New_York``, or None on failure.
+    """
+    if not value:
+        return None
+    try:
+        date_part, time_part = value.split(";", 1)
+        dt = datetime.datetime.strptime(
+            f"{date_part}{time_part}", "%Y%m%d%H%M%S",
+        )
+    except ValueError:
+        logger.warning("Could not parse whenGenerated=%r", value)
+        return None
+    return dt.replace(tzinfo=_ET)
+
+
+def parse_flex_report(xml_content: str) -> FlexReport:
+    """Parse a Flex Query XML response into a FlexReport.
+
+    Reads ``whenGenerated`` from the ``<FlexStatement>`` element and
+    pairs it with the parsed positions. If ``whenGenerated`` is missing
+    or malformed, falls back to the current ET time and logs a warning.
+
+    Parameters
+    ----------
+    xml_content : str
+        Raw XML content from the Flex Query.
+
+    Returns
+    -------
+    FlexReport
+        Aware ET timestamp paired with parsed positions.
+    """
+    from xml.etree import ElementTree as ET
+
+    when_generated: datetime.datetime | None = None
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        logger.exception("Failed to parse Flex Query XML for whenGenerated")
+        root = None
+
+    if root is not None:
+        for stmt in root.iter("FlexStatement"):
+            when_generated = _parse_when_generated(stmt.get("whenGenerated", ""))
+            if when_generated is not None:
+                break
+
+    if when_generated is None:
+        logger.warning(
+            "Flex report missing whenGenerated; falling back to current ET time",
+        )
+        when_generated = datetime.datetime.now(tz=_ET)
+
+    return FlexReport(
+        when_generated=when_generated,
+        positions=parse_flex_xml(xml_content),
+    )
+
+
 def _download(token: str, query_id: str) -> bytes:
     """Download a Flex Query report via the ibflex HTTP client (blocking I/O).
 
@@ -143,8 +220,8 @@ def _download(token: str, query_id: str) -> bytes:
     return client.download(token, query_id)
 
 
-async def fetch_positions(token: str, query_id: str) -> list[Position]:
-    """Download a Flex Query report from IB and parse positions.
+async def fetch_positions(token: str, query_id: str) -> FlexReport:
+    """Download a Flex Query report from IB and parse it.
 
     Runs the blocking ibflex download in a thread pool.
 
@@ -157,8 +234,9 @@ async def fetch_positions(token: str, query_id: str) -> list[Position]:
 
     Returns
     -------
-    list[Position]
-        Parsed option positions from the Flex Query.
+    FlexReport
+        Parsed report with the IB-stamped ``whenGenerated`` timestamp
+        and the parsed positions.
 
     Raises
     ------
@@ -169,7 +247,7 @@ async def fetch_positions(token: str, query_id: str) -> list[Position]:
     raw = await loop.run_in_executor(None, _download, token, query_id)
 
     xml_str = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-    return parse_flex_xml(xml_str)
+    return parse_flex_report(xml_str)
 
 
 def build_massive_ticker(position: Position) -> str:

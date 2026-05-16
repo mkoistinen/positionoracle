@@ -12,26 +12,26 @@ def sample_flex_xml():
     return """<?xml version="1.0" encoding="UTF-8"?>
 <FlexQueryResponse queryName="Test" type="AF">
   <FlexStatements count="1">
-    <FlexStatement accountId="U1234567">
+    <FlexStatement accountId="U1234567" whenGenerated="20991215;173045">
       <OpenPositions>
         <OpenPosition
           assetCategory="OPT"
-          symbol="AAPL  251219C00150000"
+          symbol="AAPL  991219C00150000"
           underlyingSymbol="AAPL"
           putCall="C"
           strike="150"
-          expiry="20251219"
+          expiry="20991219"
           position="10"
           costBasisMoney="5000.00"
           multiplier="100"
         />
         <OpenPosition
           assetCategory="OPT"
-          symbol="AAPL  251219P00140000"
+          symbol="AAPL  991219P00140000"
           underlyingSymbol="AAPL"
           putCall="P"
           strike="140"
-          expiry="20251219"
+          expiry="20991219"
           position="-5"
           costBasisMoney="-2500.00"
           multiplier="100"

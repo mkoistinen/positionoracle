@@ -52,6 +52,23 @@ class Position:
     multiplier: int = 100
 
 
+@dataclass(frozen=True, slots=True)
+class FlexReport:
+    """A parsed IB Flex Query report with metadata.
+
+    Attributes
+    ----------
+    when_generated : datetime.datetime
+        Timezone-aware (America/New_York) timestamp IB stamped on the
+        report at generation time. Falls back to "now" if absent.
+    positions : list[Position]
+        Parsed positions from the ``OpenPositions`` section.
+    """
+
+    when_generated: datetime.datetime
+    positions: list[Position]
+
+
 @dataclass(slots=True)
 class Greeks:
     """First- and second-order option Greeks.

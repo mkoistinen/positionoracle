@@ -188,15 +188,15 @@ class TestPositionRoutes:
         xml = """<?xml version="1.0" encoding="UTF-8"?>
 <FlexQueryResponse queryName="Test" type="AF">
   <FlexStatements count="1">
-    <FlexStatement accountId="U1234567">
+    <FlexStatement accountId="U1234567" whenGenerated="20991215;173045">
       <OpenPositions>
         <OpenPosition
           assetCategory="OPT"
-          symbol="AAPL251219C00150000"
+          symbol="AAPL991219C00150000"
           underlyingSymbol="AAPL"
           putCall="C"
           strike="150"
-          expiry="20251219"
+          expiry="20991219"
           position="10"
           costBasisMoney="5000.00"
           multiplier="100"
@@ -243,6 +243,247 @@ class TestPositionRoutes:
             cookies={_COOKIE_NAME: auth_cookie},
         )
         assert resp.status_code == 200
+
+
+class TestExpectedLatestReportDate:
+    def _et(self, year, month, day, hour=12, minute=0):
+        from zoneinfo import ZoneInfo
+        return datetime.datetime(
+            year, month, day, hour, minute, tzinfo=ZoneInfo("America/New_York"),
+        )
+
+    def test_weekday_before_publish_hour_returns_previous_business_day(self):
+        # Wednesday 2026-05-13 at 09:00 ET → expected is Tuesday 2026-05-12.
+        now = self._et(2026, 5, 13, 9, 0)
+        assert main_mod._expected_latest_report_date(now) == datetime.date(2026, 5, 12)
+
+    def test_weekday_after_publish_hour_returns_today(self):
+        # Wednesday 2026-05-13 at 18:00 ET → expected is Wednesday 2026-05-13.
+        now = self._et(2026, 5, 13, 18, 0)
+        assert main_mod._expected_latest_report_date(now) == datetime.date(2026, 5, 13)
+
+    def test_monday_morning_rolls_back_to_friday(self):
+        # Monday 2026-05-11 at 09:00 ET → expected is Friday 2026-05-08.
+        now = self._et(2026, 5, 11, 9, 0)
+        assert main_mod._expected_latest_report_date(now) == datetime.date(2026, 5, 8)
+
+    def test_saturday_returns_friday(self):
+        now = self._et(2026, 5, 16, 12, 0)
+        assert main_mod._expected_latest_report_date(now) == datetime.date(2026, 5, 15)
+
+    def test_sunday_returns_friday(self):
+        now = self._et(2026, 5, 17, 12, 0)
+        assert main_mod._expected_latest_report_date(now) == datetime.date(2026, 5, 15)
+
+
+class TestFlexFetchEndpoint:
+    @pytest.fixture(autouse=True)
+    def _reset_state(self):
+        main_mod._positions.clear()
+        main_mod._position_greeks.clear()
+        main_mod._underlying_prices.clear()
+        settings.flex_token = "tok"
+        settings.query_id = "qid"
+        settings.massive_api_key = ""
+        yield
+        main_mod._positions.clear()
+        main_mod._position_greeks.clear()
+        main_mod._underlying_prices.clear()
+        settings.flex_token = ""
+        settings.query_id = ""
+
+    async def test_unauthenticated(self, client):
+        resp = await client.post("/api/positions/fetch")
+        assert resp.status_code == 401
+
+    async def test_fresh_fetch_success(self, client, auth_cookie):
+        from zoneinfo import ZoneInfo
+
+        from positionoracle.types import FlexReport
+
+        future = Position(
+            symbol="AAPL991219C00150000",
+            underlying="AAPL",
+            contract_type=ContractType.CALL,
+            strike=150.0,
+            expiration=datetime.date(2099, 12, 19),
+            quantity=10,
+            cost_basis=5000.0,
+        )
+        when = datetime.datetime(
+            2099, 12, 15, 17, 30, tzinfo=ZoneInfo("America/New_York"),
+        )
+
+        with patch(
+            "positionoracle.main.flex.fetch_positions",
+            new_callable=AsyncMock,
+            return_value=FlexReport(when_generated=when, positions=[future]),
+        ) as mock_fetch, patch(
+            "positionoracle.main._ensure_market_data",
+            new_callable=AsyncMock,
+        ):
+            resp = await client.post(
+                "/api/positions/fetch",
+                cookies={_COOKIE_NAME: auth_cookie},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["imported"] == 1
+        assert data["cached"] is False
+        assert data["stale"] is False
+        assert data["report_generated_at"] == when.isoformat()
+        assert data["error"] is None
+        assert mock_fetch.await_count == 1
+
+    async def test_cache_hit_skips_ib(self, client, auth_cookie, tmp_path):
+        from zoneinfo import ZoneInfo
+
+        from positionoracle import db as db_mod
+
+        # Seed a position and a fresh "today's report" timestamp.
+        main_mod._positions.append(Position(
+            symbol="AAPL991219C00150000",
+            underlying="AAPL",
+            contract_type=ContractType.CALL,
+            strike=150.0,
+            expiration=datetime.date(2099, 12, 19),
+            quantity=10,
+            cost_basis=5000.0,
+        ))
+        now_et = datetime.datetime.now(tz=ZoneInfo("America/New_York"))
+        # Use a far-future report date so it always passes the
+        # "have current report" check regardless of when tests run.
+        future_report = now_et.replace(year=now_et.year + 5)
+        await db_mod.set_setting(
+            tmp_path,
+            main_mod._FLEX_REPORT_DATE_KEY,
+            future_report.isoformat(),
+        )
+
+        with patch(
+            "positionoracle.main.flex.fetch_positions",
+            new_callable=AsyncMock,
+        ) as mock_fetch, patch(
+            "positionoracle.main._ensure_market_data",
+            new_callable=AsyncMock,
+        ):
+            resp = await client.post(
+                "/api/positions/fetch",
+                cookies={_COOKIE_NAME: auth_cookie},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cached"] is True
+        assert data["stale"] is False
+        assert mock_fetch.await_count == 0
+
+    async def test_failure_with_cache_returns_stale_200(
+        self, client, auth_cookie, tmp_path,
+    ):
+        from positionoracle import db as db_mod
+
+        main_mod._positions.append(Position(
+            symbol="AAPL991219C00150000",
+            underlying="AAPL",
+            contract_type=ContractType.CALL,
+            strike=150.0,
+            expiration=datetime.date(2099, 12, 19),
+            quantity=10,
+            cost_basis=5000.0,
+        ))
+        # Seed an old report date so the cache check fails and IB is called.
+        await db_mod.set_setting(
+            tmp_path,
+            main_mod._FLEX_REPORT_DATE_KEY,
+            "2020-01-01T17:30:00-05:00",
+        )
+
+        with patch(
+            "positionoracle.main.flex.fetch_positions",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("Code=1020: Invalid request"),
+        ) as mock_fetch, patch(
+            "positionoracle.main._ensure_market_data",
+            new_callable=AsyncMock,
+        ):
+            resp = await client.post(
+                "/api/positions/fetch",
+                cookies={_COOKIE_NAME: auth_cookie},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cached"] is True
+        assert data["stale"] is True
+        assert "Code=1020" in data["error"]
+        assert mock_fetch.await_count == 1
+
+    async def test_failure_without_cache_returns_502(
+        self, client, auth_cookie,
+    ):
+        # _positions is empty per the autouse fixture.
+        with patch(
+            "positionoracle.main.flex.fetch_positions",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("Code=1020: Invalid request"),
+        ):
+            resp = await client.post(
+                "/api/positions/fetch",
+                cookies={_COOKIE_NAME: auth_cookie},
+            )
+        assert resp.status_code == 502
+        assert "Code=1020" in resp.json()["detail"]
+
+    async def test_force_bypasses_cache(self, client, auth_cookie, tmp_path):
+        from zoneinfo import ZoneInfo
+
+        from positionoracle import db as db_mod
+        from positionoracle.types import FlexReport
+
+        main_mod._positions.append(Position(
+            symbol="AAPL991219C00150000",
+            underlying="AAPL",
+            contract_type=ContractType.CALL,
+            strike=150.0,
+            expiration=datetime.date(2099, 12, 19),
+            quantity=10,
+            cost_basis=5000.0,
+        ))
+        now_et = datetime.datetime.now(tz=ZoneInfo("America/New_York"))
+        future_report = now_et.replace(year=now_et.year + 5)
+        await db_mod.set_setting(
+            tmp_path,
+            main_mod._FLEX_REPORT_DATE_KEY,
+            future_report.isoformat(),
+        )
+
+        fresh = Position(
+            symbol="AAPL991219C00150000",
+            underlying="AAPL",
+            contract_type=ContractType.CALL,
+            strike=150.0,
+            expiration=datetime.date(2099, 12, 19),
+            quantity=20,  # changed quantity to detect the upsert
+            cost_basis=10000.0,
+        )
+        when = datetime.datetime(
+            2099, 12, 16, 17, 30, tzinfo=ZoneInfo("America/New_York"),
+        )
+
+        with patch(
+            "positionoracle.main.flex.fetch_positions",
+            new_callable=AsyncMock,
+            return_value=FlexReport(when_generated=when, positions=[fresh]),
+        ) as mock_fetch, patch(
+            "positionoracle.main._ensure_market_data",
+            new_callable=AsyncMock,
+        ):
+            resp = await client.post(
+                "/api/positions/fetch?force=true",
+                cookies={_COOKIE_NAME: auth_cookie},
+            )
+        assert resp.status_code == 200
+        assert mock_fetch.await_count == 1
+        assert resp.json()["cached"] is False
 
 
 class TestSerializeSummaries:

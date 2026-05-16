@@ -1,6 +1,7 @@
 import datetime
+from zoneinfo import ZoneInfo
 
-from positionoracle.flex import build_massive_ticker, parse_flex_xml
+from positionoracle.flex import build_massive_ticker, parse_flex_report, parse_flex_xml
 from positionoracle.types import ContractType, Position
 
 
@@ -24,7 +25,7 @@ class TestParseFlexXml:
         call = calls[0]
         assert call.underlying == "AAPL"
         assert call.strike == 150.0
-        assert call.expiration == datetime.date(2025, 12, 19)
+        assert call.expiration == datetime.date(2099, 12, 19)
         assert call.quantity == 10
         assert call.multiplier == 100
 
@@ -43,6 +44,51 @@ class TestParseFlexXml:
     def test_invalid_xml_returns_empty(self):
         positions = parse_flex_xml("not xml at all")
         assert positions == []
+
+
+class TestParseFlexReport:
+    def test_extracts_when_generated(self, sample_flex_xml):
+        report = parse_flex_report(sample_flex_xml)
+        et = ZoneInfo("America/New_York")
+        assert report.when_generated == datetime.datetime(
+            2099, 12, 15, 17, 30, 45, tzinfo=et,
+        )
+        assert len(report.positions) == 3
+
+    def test_missing_when_generated_falls_back_to_now(self):
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement accountId="U1234567">
+      <OpenPositions/>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+        before = datetime.datetime.now(tz=ZoneInfo("America/New_York"))
+        report = parse_flex_report(xml)
+        after = datetime.datetime.now(tz=ZoneInfo("America/New_York"))
+        assert before <= report.when_generated <= after
+        assert report.when_generated.tzinfo is not None
+        assert report.positions == []
+
+    def test_malformed_when_generated_falls_back(self):
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement whenGenerated="not-a-timestamp">
+      <OpenPositions/>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+        report = parse_flex_report(xml)
+        # Fallback uses current time; just confirm it's tz-aware.
+        assert report.when_generated.tzinfo is not None
+        assert report.positions == []
+
+    def test_invalid_xml_falls_back(self):
+        report = parse_flex_report("not xml at all")
+        assert report.when_generated.tzinfo is not None
+        assert report.positions == []
 
 
 class TestBuildMassiveTicker:

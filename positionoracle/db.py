@@ -191,6 +191,34 @@ async def delete_position(data_dir: Path, symbol: str) -> bool:
         return cursor.rowcount > 0
 
 
+async def delete_expired_positions(data_dir: Path, today_et: datetime.date) -> int:
+    """Delete option positions with an expiration earlier than ``today_et``.
+
+    Stock positions store ``expiration = datetime.date.max`` so they're
+    never affected by this cleanup.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Application data directory.
+    today_et : datetime.date
+        Current date in market timezone (America/New_York). Rows with
+        ``expiration < today_et`` are deleted.
+
+    Returns
+    -------
+    int
+        Number of rows deleted.
+    """
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        cursor = await conn.execute(
+            "DELETE FROM positions WHERE expiration < ?",
+            (today_et.isoformat(),),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+
 async def clear_positions(data_dir: Path) -> int:
     """Delete all positions.
 

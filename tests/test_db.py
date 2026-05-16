@@ -4,6 +4,7 @@ import pytest
 
 from positionoracle.db import (
     clear_positions,
+    delete_expired_positions,
     delete_position,
     get_setting,
     init_db,
@@ -96,6 +97,74 @@ class TestDatabase:
         assert count == 2
         loaded = await load_positions(initialized_db)
         assert loaded == []
+
+    async def test_delete_expired_positions(self, initialized_db):
+        expired_call = Position(
+            symbol="AAPL240119C00150000",
+            underlying="AAPL",
+            contract_type=ContractType.CALL,
+            strike=150.0,
+            expiration=datetime.date(2024, 1, 19),
+            quantity=1,
+            cost_basis=100.0,
+        )
+        future_put = Position(
+            symbol="AAPL991219P00140000",
+            underlying="AAPL",
+            contract_type=ContractType.PUT,
+            strike=140.0,
+            expiration=datetime.date(2099, 12, 19),
+            quantity=-1,
+            cost_basis=-50.0,
+        )
+        stock = Position(
+            symbol="AAPL",
+            underlying="AAPL",
+            contract_type=ContractType.STOCK,
+            strike=0.0,
+            expiration=datetime.date.max,
+            quantity=100,
+            cost_basis=14700.0,
+            multiplier=1,
+        )
+        await upsert_positions(
+            initialized_db, [expired_call, future_put, stock],
+        )
+
+        deleted = await delete_expired_positions(
+            initialized_db, datetime.date(2026, 5, 15),
+        )
+        assert deleted == 1
+
+        loaded = await load_positions(initialized_db)
+        symbols = {p.symbol for p in loaded}
+        assert "AAPL240119C00150000" not in symbols
+        assert "AAPL991219P00140000" in symbols
+        assert "AAPL" in symbols
+
+    async def test_delete_expired_keeps_today(self, initialized_db):
+        today = datetime.date(2026, 5, 15)
+        expiring_today = Position(
+            symbol="SPY260515C00500000",
+            underlying="SPY",
+            contract_type=ContractType.CALL,
+            strike=500.0,
+            expiration=today,
+            quantity=1,
+            cost_basis=10.0,
+        )
+        await upsert_positions(initialized_db, [expiring_today])
+
+        deleted = await delete_expired_positions(initialized_db, today)
+        assert deleted == 0
+        loaded = await load_positions(initialized_db)
+        assert len(loaded) == 1
+
+    async def test_delete_expired_empty_db(self, initialized_db):
+        deleted = await delete_expired_positions(
+            initialized_db, datetime.date(2026, 5, 15),
+        )
+        assert deleted == 0
 
     async def test_settings(self, initialized_db):
         val = await get_setting(initialized_db, "test_key")

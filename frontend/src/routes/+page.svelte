@@ -152,13 +152,29 @@
 
 	let fetching = $state(false);
 
+	function formatReportAge(iso: string | null): string {
+		if (!iso) return 'unknown';
+		const reportTime = new Date(iso).getTime();
+		if (Number.isNaN(reportTime)) return iso;
+		const diffSec = Math.max(0, Math.floor((Date.now() - reportTime) / 1000));
+		if (diffSec < 60) return `${diffSec}s ago`;
+		if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+		if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+		return `${Math.floor(diffSec / 86400)}d ago`;
+	}
+
 	async function handleFetchFromIB(force: boolean = true) {
 		fetching = true;
 		importMessage = '';
 		try {
 			const result = await fetchPositionsFromIB(force);
-			const label = result.cached ? 'Loaded' : 'Fetched';
-			importMessage = `${label} ${result.imported} positions from IB`;
+			if (result.stale && result.error) {
+				const age = formatReportAge(result.report_generated_at);
+				importMessage = `Showing cached positions (report ${age}). Fresh fetch failed: ${result.error}`;
+			} else {
+				const label = result.cached ? 'Loaded' : 'Fetched';
+				importMessage = `${label} ${result.imported} positions from IB`;
+			}
 			ws?.requestRefresh();
 		} catch (e) {
 			importMessage = `Fetch failed: ${e}`;
