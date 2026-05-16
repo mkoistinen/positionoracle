@@ -5,13 +5,23 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from positionoracle.types import ContractType, FlexReport, Position
 
+if TYPE_CHECKING:
+    from positionoracle.types import SymbolLoss
+
 logger = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
+
+# ``openCloseIndicator`` values that denote a closing trade. IB sometimes
+# emits combined values like "C;O" for partial closes.
+_CLOSE_INDICATORS = {"C", "C;O"}
+_ZERO = Decimal(0)
 
 
 def parse_flex_xml(xml_content: str) -> list[Position]:
@@ -156,6 +166,87 @@ def _parse_when_generated(value: str) -> datetime.datetime | None:
     return dt.replace(tzinfo=_ET)
 
 
+def extract_losses(xml_content: str) -> list[SymbolLoss]:
+    """Extract realized-loss closing trades from a Flex Query XML.
+
+    Walks every ``<Trade>`` element and emits a ``(symbol, date)`` pair
+    for each one that is (a) a closing trade and (b) has negative
+    ``fifoPnlRealized``. Underlying symbol is resolved from
+    ``underlyingSymbol`` when present, falling back to the OCC option
+    symbol's leading token for options or the bare ``symbol`` for stock.
+
+    Parameters
+    ----------
+    xml_content : str
+        Raw Flex Query XML.
+
+    Returns
+    -------
+    list[SymbolLoss]
+        ``(underlying_symbol, trade_date)`` pairs.
+    """
+    from xml.etree import ElementTree as ET
+
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        logger.exception("Failed to parse Flex Query XML for losses")
+        return []
+
+    losses: list[SymbolLoss] = []
+    for trade in root.iter("Trade"):
+        if trade.get("openCloseIndicator", "") not in _CLOSE_INDICATORS:
+            continue
+
+        pnl_str = trade.get("fifoPnlRealized", "")
+        if not pnl_str:
+            continue
+        try:
+            pnl = Decimal(pnl_str)
+        except InvalidOperation:
+            continue
+        if pnl >= _ZERO:
+            continue
+
+        underlying = trade.get("underlyingSymbol", "").strip().upper()
+        if not underlying:
+            cat = trade.get("assetCategory", "")
+            sym = trade.get("symbol", "").strip().upper()
+            if cat == "STK":
+                underlying = sym
+            elif cat == "OPT" and sym:
+                underlying = sym.split()[0]
+        if not underlying:
+            logger.warning(
+                "Could not resolve underlying for trade %s",
+                trade.get("tradeID", "?"),
+            )
+            continue
+
+        date_str = trade.get("tradeDate", "")
+        if not date_str:
+            logger.warning(
+                "Trade %s missing tradeDate — skipping",
+                trade.get("tradeID", "?"),
+            )
+            continue
+        try:
+            trade_date = datetime.date.fromisoformat(date_str)
+        except ValueError:
+            try:
+                trade_date = datetime.datetime.strptime(
+                    date_str, "%Y%m%d",
+                ).date()
+            except ValueError:
+                logger.warning("Unparseable tradeDate %r — skipping", date_str)
+                continue
+
+        losses.append((underlying, trade_date))
+
+    logger.info("Extracted %d realized-loss trade(s) from Flex Query", len(losses))
+    return losses
+
+
 def parse_flex_report(xml_content: str) -> FlexReport:
     """Parse a Flex Query XML response into a FlexReport.
 
@@ -197,6 +288,7 @@ def parse_flex_report(xml_content: str) -> FlexReport:
     return FlexReport(
         when_generated=when_generated,
         positions=parse_flex_xml(xml_content),
+        losses=extract_losses(xml_content),
     )
 
 

@@ -31,7 +31,14 @@ from positionoracle import auth, beta, db, flex, gex, massive
 from positionoracle.advisor import build_portfolio_summary
 from positionoracle.config import Settings, get_settings
 from positionoracle.greeks import compute_greeks_from_massive
-from positionoracle.types import ContractType, GEXProfile, Greeks, Position, PositionGreeks
+from positionoracle.types import (
+    BlacklistEntry,
+    ContractType,
+    GEXProfile,
+    Greeks,
+    Position,
+    PositionGreeks,
+)
 from positionoracle.ws import ConnectionManager
 
 if TYPE_CHECKING:
@@ -59,6 +66,7 @@ http_client: httpx.AsyncClient | None = None
 _underlying_prices: dict[str, float] = {}
 _position_greeks: dict[str, PositionGreeks] = {}
 _positions: list[Position] = []
+_blacklist: list[BlacklistEntry] = []
 _last_report_generated: str | None = None
 _snapshot_task: asyncio.Task[None] | None = None
 _beta_task: asyncio.Task[None] | None = None
@@ -690,7 +698,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     settings = get_settings()
     await db.init_db(settings.data_dir)
     await _reload_positions()
-    logger.info("Loaded %d positions from database", len(_positions))
+    await _reload_blacklist()
+    logger.info(
+        "Loaded %d positions and %d blacklist entries from database",
+        len(_positions),
+        len(_blacklist),
+    )
 
     # Load cached betas
     cached = await beta.load_cached_betas(settings.data_dir)
@@ -896,7 +909,9 @@ async def import_positions(request: Request, file: UploadFile) -> JSONResponse:
         _FLEX_REPORT_DATE_KEY,
         report.when_generated.isoformat(),
     )
+    await db.bulk_upsert_blacklist(settings.data_dir, report.losses)
     await _reload_positions()
+    await _reload_blacklist()
 
     await _init_position_greeks()
     await _recompute_positions()
@@ -954,6 +969,21 @@ async def _reload_positions() -> None:
     _last_report_generated = await db.get_setting(
         settings.data_dir, _FLEX_REPORT_DATE_KEY,
     )
+
+
+async def _reload_blacklist() -> None:
+    """Prune expired wash-sale entries and refresh ``_blacklist``.
+
+    Called at startup and after any successful Flex Query ingest. Uses
+    ET ``today`` so pruning aligns with market timezone, not server wall
+    time.
+    """
+    global _blacklist
+    today_et = datetime.datetime.now(tz=_ET).date()
+    pruned = await db.prune_blacklist(settings.data_dir, today_et)
+    if pruned:
+        logger.info("Pruned %d expired wash-sale entry(ies)", pruned)
+    _blacklist = await db.load_blacklist(settings.data_dir)
 
 
 def _flex_response_payload(
@@ -1091,7 +1121,9 @@ async def fetch_positions(
         report.when_generated.isoformat(),
     )
     await db.set_setting(settings.data_dir, _FLEX_LAST_ATTEMPT_KEY, attempt_iso)
+    await db.bulk_upsert_blacklist(settings.data_dir, report.losses)
     await _reload_positions()
+    await _reload_blacklist()
 
     await _init_position_greeks()
     await _recompute_positions()
@@ -1152,6 +1184,37 @@ async def clear_all_positions(request: Request) -> JSONResponse:
     _positions = []
     _position_greeks.clear()
     return JSONResponse({"status": "ok", "deleted": count})
+
+
+# ---------------------------------------------------------------------------
+# Wash-sale routes
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/washsale/blacklist")
+async def get_washsale_blacklist(request: Request) -> JSONResponse:
+    """Return the current wash-sale blacklist.
+
+    Always prunes expired entries before responding, so the result
+    reflects "today" without waiting for an ingest. Each entry shows
+    the most recent realized-loss date for its symbol and the IRS
+    30-day window expiry.
+    """
+    _require_auth(request)
+    await _reload_blacklist()
+    today_et = datetime.datetime.now(tz=_ET).date()
+    return JSONResponse({
+        "entries": [
+            {
+                "symbol": e.symbol,
+                "loss_date": e.loss_date.isoformat(),
+                "expires": e.expires.isoformat(),
+                "days_remaining": max(0, (e.expires - today_et).days),
+            }
+            for e in _blacklist
+        ],
+        "last_report_generated": _last_report_generated,
+    })
 
 
 # ---------------------------------------------------------------------------

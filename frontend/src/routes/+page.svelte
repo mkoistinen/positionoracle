@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout, refreshGex } from '$lib/api';
+	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout, refreshGex, getBlacklist, type BlacklistEntry } from '$lib/api';
 	import { PortfolioWebSocket, type PortfolioUpdate, type PortfolioRollup, type UnderlyingSummary, type GEXProfile } from '$lib/ws';
 	import { evaluateAll, evaluateNetDelta, evaluateNetTheta, evaluateNetVega, evaluateNetGamma, evaluateBetaWeightedDelta, signalClass } from '$lib/greek-signals';
 	import { tooltip } from '$lib/tooltip';
@@ -15,6 +15,10 @@
 	let importMessage = $state('');
 	let lastUpdated = $state('');
 	let lastReportGenerated = $state<string | null>(null);
+	let blacklist = $state<BlacklistEntry[]>([]);
+	let blacklistLoading = $state(false);
+	let blacklistError = $state('');
+	let washsaleQuery = $state('');
 	let marketOpen = $state(false);
 	let portfolio = $state<PortfolioRollup>({ net_delta: 0, net_gamma: 0, net_theta: 0, net_vega: 0, beta_weighted_delta: 0, spy_price: 0 });
 	let gexProfiles = $state<Record<string, GEXProfile>>({});
@@ -71,6 +75,23 @@
 		} catch {
 			// ignore
 		}
+		if (tab === 'washsale') {
+			loadBlacklist();
+		}
+	}
+
+	async function loadBlacklist() {
+		if (!authenticated) return;
+		blacklistLoading = true;
+		blacklistError = '';
+		try {
+			const result = await getBlacklist();
+			blacklist = result.entries;
+		} catch (e) {
+			blacklistError = `Failed to load blacklist: ${e}`;
+		} finally {
+			blacklistLoading = false;
+		}
 	}
 
 	const EXPANDED_KEY = 'po_expanded';
@@ -117,6 +138,9 @@
 			if (authenticated) {
 				startWebSocket();
 				handleFetchFromIB(false);
+				if (activeTab === 'washsale') {
+					loadBlacklist();
+				}
 			}
 		} catch (e) {
 			console.error('Failed to check auth status:', e);
@@ -171,6 +195,7 @@
 			const result = await importPositions(file);
 			importMessage = `Imported ${result.imported} positions from ${file.name}`;
 			ws?.requestRefresh();
+			loadBlacklist();
 		} catch (e) {
 			importMessage = `Import failed: ${e}`;
 		} finally {
@@ -253,6 +278,7 @@
 				importMessage = `${label} ${result.imported} positions from IB`;
 			}
 			ws?.requestRefresh();
+			loadBlacklist();
 		} catch (e) {
 			importMessage = `Fetch failed: ${e}`;
 		} finally {
@@ -412,7 +438,7 @@
 			aria-selected={activeTab === 'washsale'}
 			onclick={() => setActiveTab('washsale')}
 		>
-			WashSale
+			Wash-Sale Watcher
 		</button>
 	</div>
 
@@ -614,12 +640,85 @@
 		{/if}
 	</main>
 	{:else if activeTab === 'washsale'}
-	<main class="washsale-stub">
-		<div class="empty">
-			<h2>WashSale</h2>
-			<p>30-day blacklist of symbols with recent realized losses.</p>
-			<p class="muted">Coming in the next pass — this tab will surface the wash-sale tracker that currently lives in <code>washwatch</code>, fed by the same Flex Query as the Greeks tab.</p>
+	<main class="washsale">
+		<div class="ws-header">
+			<h2>Wash-Sale Watcher</h2>
+			<p class="muted">
+				Symbols where you've realized a loss in the last 30 days. Buying any of
+				these triggers a wash sale under IRS rules.
+			</p>
 		</div>
+
+		<div class="ws-search">
+			<input
+				type="text"
+				placeholder="Check a symbol (e.g. AAPL)"
+				bind:value={washsaleQuery}
+				autocomplete="off"
+				spellcheck="false"
+			/>
+			{#if washsaleQuery.trim()}
+				{@const q = washsaleQuery.trim().toUpperCase()}
+				{@const hit = blacklist.find(e => e.symbol === q)}
+				{#if hit}
+					<div class="ws-verdict ws-verdict-blocked">
+						<strong>{q} — BLOCKED</strong> until {hit.expires}
+						<span class="muted">({hit.days_remaining}d remaining)</span>
+					</div>
+				{:else}
+					<div class="ws-verdict ws-verdict-clear">
+						<strong>{q} — CLEAR</strong>
+						<span class="muted">No wash-sale risk in the current 30-day window</span>
+					</div>
+				{/if}
+			{/if}
+		</div>
+
+		{#if blacklistError}
+			<div class="ws-error">{blacklistError}</div>
+		{:else if blacklistLoading && blacklist.length === 0}
+			<div class="ws-empty">Loading…</div>
+		{:else if blacklist.length === 0}
+			<div class="ws-empty">
+				No symbols blacklisted. Fetch a Flex Query that contains realized
+				losses to populate this list.
+			</div>
+		{:else}
+			{@const filtered = washsaleQuery.trim()
+				? blacklist.filter(e => e.symbol.includes(washsaleQuery.trim().toUpperCase()))
+				: blacklist}
+			<table class="ws-table">
+				<thead>
+					<tr>
+						<th>Symbol</th>
+						<th>Loss Date</th>
+						<th>Expires</th>
+						<th class="num">Days Remaining</th>
+					</tr>
+				</thead>
+				<tbody>
+					{#each filtered as entry (entry.symbol)}
+						<tr>
+							<td class="ws-symbol">{entry.symbol}</td>
+							<td>{entry.loss_date}</td>
+							<td>{entry.expires}</td>
+							<td class="num" class:ws-imminent={entry.days_remaining < 7}>
+								{entry.days_remaining}
+							</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
+			{#if filtered.length === 0}
+				<div class="ws-empty">No symbols match "{washsaleQuery}".</div>
+			{/if}
+		{/if}
+
+		{#if lastReportGenerated}
+			<div class="last-import">
+				Report generated: {formatReportTimestamp(lastReportGenerated)}
+			</div>
+		{/if}
 	</main>
 	{/if}
 {/if}
@@ -871,20 +970,129 @@
 		background: transparent;
 	}
 
-	.washsale-stub .empty {
-		max-width: 36rem;
+	.washsale {
+		max-width: 60rem;
+		margin: 0 auto;
+		width: 100%;
+		gap: 1.25rem;
 	}
 
-	.washsale-stub .empty h2 {
-		margin: 0 0 0.5rem;
+	.ws-header h2 {
+		margin: 0 0 0.25rem;
 		color: #e2e8f0;
 	}
 
-	.washsale-stub .empty code {
-		background: #1e293b;
-		padding: 0.1rem 0.35rem;
-		border-radius: 0.25rem;
-		font-size: 0.85em;
+	.ws-header .muted {
+		font-size: 0.875rem;
+		color: #94a3b8;
+		margin: 0;
+	}
+
+	.ws-search {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.ws-search input {
+		background: #0f172a;
+		border: 1px solid #334155;
+		border-radius: 0.375rem;
+		padding: 0.6rem 0.85rem;
+		color: #e2e8f0;
+		font-size: 0.95rem;
+		font-family: inherit;
+		font-variant-numeric: tabular-nums;
+		text-transform: uppercase;
+	}
+
+	.ws-search input:focus {
+		outline: none;
+		border-color: #3b82f6;
+	}
+
+	.ws-verdict {
+		padding: 0.75rem 1rem;
+		border-radius: 0.375rem;
+		font-size: 0.95rem;
+		display: flex;
+		gap: 0.75rem;
+		align-items: baseline;
+		flex-wrap: wrap;
+	}
+
+	.ws-verdict .muted {
+		color: rgba(255, 255, 255, 0.7);
+		font-size: 0.85rem;
+	}
+
+	.ws-verdict-blocked {
+		background: #3f1d1d;
+		color: #fca5a5;
+		border: 1px solid #7f1d1d;
+	}
+
+	.ws-verdict-clear {
+		background: #14322a;
+		color: #86efac;
+		border: 1px solid #166534;
+	}
+
+	.ws-empty,
+	.ws-error {
+		padding: 1.25rem;
+		text-align: center;
+		color: #94a3b8;
+		background: #0f172a;
+		border-radius: 0.375rem;
+	}
+
+	.ws-error {
+		color: #fca5a5;
+	}
+
+	.ws-table {
+		width: 100%;
+		border-collapse: collapse;
+		background: #0f172a;
+		border-radius: 0.375rem;
+		overflow: hidden;
+	}
+
+	.ws-table th,
+	.ws-table td {
+		padding: 0.6rem 0.85rem;
+		text-align: left;
+		font-size: 0.9rem;
+		border-bottom: 1px solid #1e293b;
+	}
+
+	.ws-table thead th {
+		background: #111c2e;
+		color: #94a3b8;
+		font-weight: 600;
+		font-size: 0.8rem;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+	}
+
+	.ws-table tbody tr:last-child td {
+		border-bottom: none;
+	}
+
+	.ws-table .num {
+		text-align: right;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.ws-symbol {
+		font-weight: 600;
+		color: #e2e8f0;
+	}
+
+	.ws-imminent {
+		color: #fca5a5;
+		font-weight: 600;
 	}
 
 	main {

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import aiosqlite
 
-from positionoracle.types import ContractType, Position
+from positionoracle.types import BlacklistEntry, ContractType, Position
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -37,6 +37,16 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 )
 """
+
+_CREATE_BLACKLIST = """
+CREATE TABLE IF NOT EXISTS blacklist (
+    symbol TEXT PRIMARY KEY,
+    loss_date TEXT NOT NULL,
+    expires TEXT NOT NULL
+)
+"""
+
+_WASH_SALE_WINDOW_DAYS = 30
 
 
 def db_path(data_dir: Path) -> str:
@@ -67,6 +77,7 @@ async def init_db(data_dir: Path) -> None:
     async with aiosqlite.connect(db_path(data_dir)) as conn:
         await conn.execute(_CREATE_POSITIONS)
         await conn.execute(_CREATE_SETTINGS)
+        await conn.execute(_CREATE_BLACKLIST)
         await conn.commit()
     logger.info("Database initialized at %s", db_path(data_dir))
 
@@ -306,3 +317,140 @@ async def get_thresholds(data_dir: Path) -> dict[str, float]:
         stored = json.loads(raw)
         defaults.update(stored)
     return defaults
+
+
+async def bulk_upsert_blacklist(
+    data_dir: Path,
+    losses: list[tuple[str, datetime.date]],
+) -> int:
+    """Upsert wash-sale blacklist entries.
+
+    For each ``(symbol, loss_date)``: if no row exists for the symbol it
+    is inserted; if a row exists and the new ``loss_date`` is more recent
+    than the stored one, the row is updated; otherwise the existing row
+    is left alone. Expiry is always ``loss_date + 30 days``. Symbols are
+    upper-cased and stripped.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Application data directory.
+    losses : list[tuple[str, datetime.date]]
+        Realized-loss closing trades.
+
+    Returns
+    -------
+    int
+        Number of rows that were inserted or updated. Note that SQLite
+        reports the same per-row regardless of whether the WHERE clause
+        elided the UPDATE — treat this as a best-effort count.
+    """
+    if not losses:
+        return 0
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        for symbol, loss_date in losses:
+            sym = symbol.upper().strip()
+            if not sym:
+                continue
+            expires = loss_date + datetime.timedelta(days=_WASH_SALE_WINDOW_DAYS)
+            await conn.execute(
+                """
+                INSERT INTO blacklist (symbol, loss_date, expires)
+                VALUES (?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    loss_date = excluded.loss_date,
+                    expires   = excluded.expires
+                WHERE excluded.loss_date > blacklist.loss_date
+                """,
+                (sym, loss_date.isoformat(), expires.isoformat()),
+            )
+        await conn.commit()
+    return len(losses)
+
+
+async def prune_blacklist(data_dir: Path, today_et: datetime.date) -> int:
+    """Delete blacklist rows whose expiry is before ``today_et``.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Application data directory.
+    today_et : datetime.date
+        Current date in market timezone.
+
+    Returns
+    -------
+    int
+        Number of rows deleted.
+    """
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        cursor = await conn.execute(
+            "DELETE FROM blacklist WHERE expires < ?",
+            (today_et.isoformat(),),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+
+async def load_blacklist(data_dir: Path) -> list[BlacklistEntry]:
+    """Return active blacklist entries sorted by expiry ascending.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Application data directory.
+
+    Returns
+    -------
+    list[BlacklistEntry]
+        All currently-stored entries (caller should prune first).
+    """
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT symbol, loss_date, expires FROM blacklist "
+            "ORDER BY expires ASC, symbol ASC"
+        )
+        rows = await cursor.fetchall()
+    return [
+        BlacklistEntry(
+            symbol=row["symbol"],
+            loss_date=datetime.date.fromisoformat(row["loss_date"]),
+            expires=datetime.date.fromisoformat(row["expires"]),
+        )
+        for row in rows
+    ]
+
+
+async def lookup_blacklist(data_dir: Path, symbol: str) -> BlacklistEntry | None:
+    """Look up a single symbol in the blacklist.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Application data directory.
+    symbol : str
+        Ticker to look up (case-insensitive).
+
+    Returns
+    -------
+    BlacklistEntry | None
+        The matching entry or ``None``.
+    """
+    sym = symbol.upper().strip()
+    if not sym:
+        return None
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT symbol, loss_date, expires FROM blacklist WHERE symbol = ?",
+            (sym,),
+        )
+        row = await cursor.fetchone()
+    if row is None:
+        return None
+    return BlacklistEntry(
+        symbol=row["symbol"],
+        loss_date=datetime.date.fromisoformat(row["loss_date"]),
+        expires=datetime.date.fromisoformat(row["expires"]),
+    )

@@ -1,7 +1,12 @@
 import datetime
 from zoneinfo import ZoneInfo
 
-from positionoracle.flex import build_massive_ticker, parse_flex_report, parse_flex_xml
+from positionoracle.flex import (
+    build_massive_ticker,
+    extract_losses,
+    parse_flex_report,
+    parse_flex_xml,
+)
 from positionoracle.types import ContractType, Position
 
 
@@ -89,6 +94,78 @@ class TestParseFlexReport:
         report = parse_flex_report("not xml at all")
         assert report.when_generated.tzinfo is not None
         assert report.positions == []
+
+
+class TestExtractLosses:
+    def _xml(self, *trades: str) -> str:
+        joined = "\n".join(trades)
+        return f"""<?xml version="1.0"?>
+<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement>
+      <Trades>
+{joined}
+      </Trades>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+
+    def test_extracts_closing_loss_on_stock(self):
+        xml = self._xml(
+            '<Trade assetCategory="STK" symbol="AAPL" underlyingSymbol="AAPL" '
+            'openCloseIndicator="C" tradeDate="2026-04-01" fifoPnlRealized="-123.45"/>',
+        )
+        losses = extract_losses(xml)
+        assert losses == [("AAPL", datetime.date(2026, 4, 1))]
+
+    def test_skips_opening_trade(self):
+        xml = self._xml(
+            '<Trade assetCategory="STK" symbol="AAPL" underlyingSymbol="AAPL" '
+            'openCloseIndicator="O" tradeDate="2026-04-01" fifoPnlRealized="-50"/>',
+        )
+        assert extract_losses(xml) == []
+
+    def test_skips_profitable_close(self):
+        xml = self._xml(
+            '<Trade assetCategory="STK" symbol="AAPL" underlyingSymbol="AAPL" '
+            'openCloseIndicator="C" tradeDate="2026-04-01" fifoPnlRealized="100"/>',
+        )
+        assert extract_losses(xml) == []
+
+    def test_accepts_partial_close_indicator(self):
+        # IB emits "C;O" for trades that both close and re-open.
+        xml = self._xml(
+            '<Trade assetCategory="STK" symbol="MSFT" underlyingSymbol="MSFT" '
+            'openCloseIndicator="C;O" tradeDate="2026-04-02" fifoPnlRealized="-1.50"/>',
+        )
+        assert extract_losses(xml) == [("MSFT", datetime.date(2026, 4, 2))]
+
+    def test_option_resolves_underlying(self):
+        # No underlyingSymbol attribute — must derive from OCC option symbol.
+        xml = self._xml(
+            '<Trade assetCategory="OPT" symbol="ALAB  260227P00150000" '
+            'openCloseIndicator="C" tradeDate="2026-02-27" fifoPnlRealized="-300"/>',
+        )
+        assert extract_losses(xml) == [("ALAB", datetime.date(2026, 2, 27))]
+
+    def test_yyyymmdd_trade_date(self):
+        xml = self._xml(
+            '<Trade assetCategory="STK" symbol="NVDA" underlyingSymbol="NVDA" '
+            'openCloseIndicator="C" tradeDate="20260315" fifoPnlRealized="-42"/>',
+        )
+        assert extract_losses(xml) == [("NVDA", datetime.date(2026, 3, 15))]
+
+    def test_invalid_pnl_skipped(self):
+        xml = self._xml(
+            '<Trade assetCategory="STK" symbol="AAPL" underlyingSymbol="AAPL" '
+            'openCloseIndicator="C" tradeDate="2026-04-01" fifoPnlRealized=""/>',
+            '<Trade assetCategory="STK" symbol="MSFT" underlyingSymbol="MSFT" '
+            'openCloseIndicator="C" tradeDate="2026-04-01" fifoPnlRealized="not-a-number"/>',
+        )
+        assert extract_losses(xml) == []
+
+    def test_malformed_xml_returns_empty(self):
+        assert extract_losses("not xml") == []
 
 
 class TestBuildMassiveTicker:

@@ -3,12 +3,16 @@ import datetime
 import pytest
 
 from positionoracle.db import (
+    bulk_upsert_blacklist,
     clear_positions,
     delete_expired_positions,
     delete_position,
     get_setting,
     init_db,
+    load_blacklist,
     load_positions,
+    lookup_blacklist,
+    prune_blacklist,
     set_setting,
     upsert_positions,
 )
@@ -165,6 +169,69 @@ class TestDatabase:
             initialized_db, datetime.date(2026, 5, 15),
         )
         assert deleted == 0
+
+    async def test_blacklist_upsert_and_load(self, initialized_db):
+        await bulk_upsert_blacklist(initialized_db, [
+            ("AAPL", datetime.date(2026, 4, 1)),
+            ("MSFT", datetime.date(2026, 4, 15)),
+        ])
+        entries = await load_blacklist(initialized_db)
+        symbols = [e.symbol for e in entries]
+        assert symbols == ["AAPL", "MSFT"]  # sorted by expires ASC
+        assert entries[0].expires == datetime.date(2026, 5, 1)
+        assert entries[1].expires == datetime.date(2026, 5, 15)
+
+    async def test_blacklist_normalizes_symbol_case(self, initialized_db):
+        await bulk_upsert_blacklist(initialized_db, [
+            ("aapl", datetime.date(2026, 4, 1)),
+        ])
+        entries = await load_blacklist(initialized_db)
+        assert entries[0].symbol == "AAPL"
+
+    async def test_blacklist_keeps_most_recent_loss_date(self, initialized_db):
+        # First write: April 1.
+        await bulk_upsert_blacklist(initialized_db, [
+            ("AAPL", datetime.date(2026, 4, 1)),
+        ])
+        # Second write with older date — should NOT overwrite.
+        await bulk_upsert_blacklist(initialized_db, [
+            ("AAPL", datetime.date(2026, 3, 1)),
+        ])
+        entries = await load_blacklist(initialized_db)
+        assert entries[0].loss_date == datetime.date(2026, 4, 1)
+
+        # Third write with newer date — SHOULD overwrite.
+        await bulk_upsert_blacklist(initialized_db, [
+            ("AAPL", datetime.date(2026, 4, 20)),
+        ])
+        entries = await load_blacklist(initialized_db)
+        assert entries[0].loss_date == datetime.date(2026, 4, 20)
+        assert entries[0].expires == datetime.date(2026, 5, 20)
+
+    async def test_blacklist_prune(self, initialized_db):
+        await bulk_upsert_blacklist(initialized_db, [
+            ("EXPIRED", datetime.date(2025, 1, 1)),  # expires 2025-01-31
+            ("ACTIVE", datetime.date(2026, 5, 1)),   # expires 2026-05-31
+        ])
+        pruned = await prune_blacklist(initialized_db, datetime.date(2026, 5, 16))
+        assert pruned == 1
+        remaining = await load_blacklist(initialized_db)
+        assert [e.symbol for e in remaining] == ["ACTIVE"]
+
+    async def test_blacklist_lookup(self, initialized_db):
+        await bulk_upsert_blacklist(initialized_db, [
+            ("AAPL", datetime.date(2026, 4, 1)),
+        ])
+        hit = await lookup_blacklist(initialized_db, "aapl")
+        assert hit is not None
+        assert hit.symbol == "AAPL"
+        miss = await lookup_blacklist(initialized_db, "TSLA")
+        assert miss is None
+
+    async def test_blacklist_empty_bulk_is_noop(self, initialized_db):
+        n = await bulk_upsert_blacklist(initialized_db, [])
+        assert n == 0
+        assert await load_blacklist(initialized_db) == []
 
     async def test_settings(self, initialized_db):
         val = await get_setting(initialized_db, "test_key")

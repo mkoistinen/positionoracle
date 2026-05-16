@@ -245,6 +245,49 @@ class TestPositionRoutes:
         assert resp.status_code == 200
 
 
+class TestWashsaleBlacklist:
+    @pytest.fixture(autouse=True)
+    def _reset_state(self):
+        main_mod._blacklist.clear()
+        main_mod._last_report_generated = None
+        yield
+        main_mod._blacklist.clear()
+        main_mod._last_report_generated = None
+
+    async def test_unauthenticated(self, client):
+        resp = await client.get("/api/washsale/blacklist")
+        assert resp.status_code == 401
+
+    async def test_empty(self, client, auth_cookie):
+        resp = await client.get(
+            "/api/washsale/blacklist",
+            cookies={_COOKIE_NAME: auth_cookie},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["entries"] == []
+        assert data["last_report_generated"] is None
+
+    async def test_after_upsert_returns_entries_sorted(
+        self, client, auth_cookie, tmp_path,
+    ):
+        from positionoracle import db as db_mod
+        await db_mod.bulk_upsert_blacklist(tmp_path, [
+            ("ZZZ", datetime.date(2099, 6, 1)),  # later expiry
+            ("AAA", datetime.date(2099, 4, 1)),  # earlier expiry
+        ])
+        resp = await client.get(
+            "/api/washsale/blacklist",
+            cookies={_COOKIE_NAME: auth_cookie},
+        )
+        assert resp.status_code == 200
+        entries = resp.json()["entries"]
+        # Sorted by expires ASC
+        assert [e["symbol"] for e in entries] == ["AAA", "ZZZ"]
+        # days_remaining is non-negative
+        assert all(e["days_remaining"] >= 0 for e in entries)
+
+
 class TestExpectedLatestReportDate:
     def _et(self, year, month, day, hour=12, minute=0):
         from zoneinfo import ZoneInfo
@@ -317,7 +360,7 @@ class TestFlexFetchEndpoint:
         with patch(
             "positionoracle.main.flex.fetch_positions",
             new_callable=AsyncMock,
-            return_value=FlexReport(when_generated=when, positions=[future]),
+            return_value=FlexReport(when_generated=when, positions=[future], losses=[]),
         ) as mock_fetch, patch(
             "positionoracle.main._ensure_market_data",
             new_callable=AsyncMock,
@@ -472,7 +515,7 @@ class TestFlexFetchEndpoint:
         with patch(
             "positionoracle.main.flex.fetch_positions",
             new_callable=AsyncMock,
-            return_value=FlexReport(when_generated=when, positions=[fresh]),
+            return_value=FlexReport(when_generated=when, positions=[fresh], losses=[]),
         ) as mock_fetch, patch(
             "positionoracle.main._ensure_market_data",
             new_callable=AsyncMock,

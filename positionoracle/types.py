@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING, TypedDict
 if TYPE_CHECKING:
     import datetime
 
+    SymbolLoss = tuple[str, datetime.date]
+    """``(underlying_symbol, trade_date)`` pair for a realized-loss closing trade."""
+
 
 class ContractType(Enum):
     """Position type."""
@@ -53,6 +56,25 @@ class Position:
 
 
 @dataclass(frozen=True, slots=True)
+class BlacklistEntry:
+    """A wash-sale blacklist entry.
+
+    Attributes
+    ----------
+    symbol : str
+        Underlying ticker (always upper-cased).
+    loss_date : datetime.date
+        Most recent realized-loss date for this symbol.
+    expires : datetime.date
+        ``loss_date + 30`` — the IRS wash-sale window end.
+    """
+
+    symbol: str
+    loss_date: datetime.date
+    expires: datetime.date
+
+
+@dataclass(frozen=True, slots=True)
 class FlexReport:
     """A parsed IB Flex Query report with metadata.
 
@@ -63,10 +85,14 @@ class FlexReport:
         report at generation time. Falls back to "now" if absent.
     positions : list[Position]
         Parsed positions from the ``OpenPositions`` section.
+    losses : list[SymbolLoss]
+        ``(underlying_symbol, trade_date)`` pairs for each closing
+        trade with negative realized P&L. Drives the wash-sale tracker.
     """
 
     when_generated: datetime.datetime
     positions: list[Position]
+    losses: list[SymbolLoss]
 
 
 @dataclass(slots=True)

@@ -82,3 +82,19 @@ export async function analyzeSymbol(underlying: string): Promise<{ analysis: str
 export async function refreshGex(): Promise<{ status: string; profiles: string[] }> {
 	return fetchJson('/api/gex/refresh', { method: 'POST' });
 }
+
+export interface BlacklistEntry {
+	symbol: string;
+	loss_date: string;
+	expires: string;
+	days_remaining: number;
+}
+
+export interface BlacklistResponse {
+	entries: BlacklistEntry[];
+	last_report_generated: string | null;
+}
+
+export async function getBlacklist(): Promise<BlacklistResponse> {
+	return fetchJson('/api/washsale/blacklist');
+}
