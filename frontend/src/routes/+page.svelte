@@ -580,18 +580,19 @@
 						<table>
 							<thead>
 								<tr>
-									<th>Type</th>
-									<th>Strike</th>
-									<th>Exp</th>
-									<th>Qty</th>
-									<th>IV</th>
-									<th>&Delta;</th>
-									<th>&Theta;</th>
-									<th>Vega</th>
-									<th>&Gamma;</th>
-									<th>Vanna</th>
-									<th>Charm</th>
-									<th>Vomma</th>
+									<th use:tooltip={'Type — Call, Put, or Stock.'}>Type</th>
+									<th use:tooltip={'Strike — Contract strike price.'}>Strike</th>
+									<th use:tooltip={'Expiration — Contract expiration date.'}>Exp</th>
+									<th use:tooltip={'Quantity — Number of contracts (negative = short).'}>Qty</th>
+									<th use:tooltip={'Implied Volatility — Annualized vol the market is currently pricing into this contract.'}>IV</th>
+									<th use:tooltip={'VRP — Volatility Risk Premium ratio: trailing 21-day realized vol divided by the IV implied by your entry premium. Below 1.0 favors short positions; above 1.0 favors long positions.'}>VRP</th>
+									<th use:tooltip={'Delta — Change in option price per $1 move in the underlying (per contract).'}>&Delta;</th>
+									<th use:tooltip={'Theta — Daily change in option price from time decay (per contract, per calendar day).'}>&Theta;</th>
+									<th use:tooltip={'Vega — Change in option price per 1% change in implied volatility (per contract).'}>Vega</th>
+									<th use:tooltip={'Gamma — Change in delta per $1 move in the underlying (per contract).'}>&Gamma;</th>
+									<th use:tooltip={'Vanna — Change in delta per 1% change in implied volatility (per contract).'}>Vanna</th>
+									<th use:tooltip={'Charm — Change in delta per calendar day (per contract).'}>Charm</th>
+									<th use:tooltip={'Vomma — Change in vega per 1% change in implied volatility (per contract).'}>Vomma</th>
 								</tr>
 							</thead>
 							<tbody>
@@ -604,6 +605,9 @@
 										<td>{isStock ? '—' : pos.expiration}</td>
 										<td class:negative={pos.quantity < 0}>{pos.quantity}</td>
 										<td>{isStock ? '—' : (pos.greeks.implied_volatility * 100).toFixed(1) + '%'}</td>
+										<td class={signalClass(signals.vrp.level)} use:tooltip={signals.vrp.reason}>
+											{isStock || pos.vrp == null ? '—' : pos.vrp.toFixed(2)}
+										</td>
 										<td class={signalClass(signals.delta.level)} use:tooltip={signals.delta.reason}>
 											{isStock ? pos.quantity : formatGreek(pos.greeks.delta)}
 										</td>

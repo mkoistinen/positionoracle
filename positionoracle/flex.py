@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from positionoracle.types import ContractType, FlexReport, Position
+from positionoracle.types import ContractType, FlexReport, OpeningTrade, Position
 
 if TYPE_CHECKING:
     from positionoracle.types import SymbolLoss
@@ -21,6 +21,9 @@ _ET = ZoneInfo("America/New_York")
 # ``openCloseIndicator`` values that denote a closing trade. IB sometimes
 # emits combined values like "C;O" for partial closes.
 _CLOSE_INDICATORS = {"C", "C;O"}
+# Indicators that denote an opening trade (full open or a partial that
+# opens new contracts alongside closing some).
+_OPEN_INDICATORS = {"O", "O;C", "C;O"}
 _ZERO = Decimal(0)
 
 
@@ -247,6 +250,129 @@ def extract_losses(xml_content: str) -> list[SymbolLoss]:
     return losses
 
 
+def _parse_trade_datetime(value: str) -> datetime.datetime | None:
+    """Parse IB's ``tradeDateTime`` (or ``dateTime``) into an aware ET datetime.
+
+    IB usually formats this as ``YYYYMMDD;HHMMSS`` but some Flex
+    configurations emit ISO 8601. Falls back to ``None`` if neither
+    parses.
+    """
+    if not value:
+        return None
+    # IB compact form first.
+    try:
+        date_part, time_part = value.split(";", 1)
+        dt = datetime.datetime.strptime(
+            f"{date_part}{time_part}", "%Y%m%d%H%M%S",
+        )
+        return dt.replace(tzinfo=_ET)
+    except ValueError:
+        pass
+    # Try ISO 8601 (with optional T separator).
+    try:
+        dt = datetime.datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_ET)
+        return dt
+    except ValueError:
+        logger.warning("Could not parse tradeDateTime=%r", value)
+        return None
+
+
+def extract_opening_trades(xml_content: str) -> dict[str, OpeningTrade]:
+    """Extract earliest opening trade per option symbol from a Flex XML.
+
+    Walks every ``<Trade>`` element with ``assetCategory="OPT"`` and an
+    opening indicator. For symbols that appear in multiple opening
+    trades (averaged-in positions) only the earliest is retained — the
+    cost-basis-weighted entry price comes from the ``OpenPosition``
+    record, so we just need the entry *time* for the spot lookup.
+
+    Parameters
+    ----------
+    xml_content : str
+        Raw Flex Query XML.
+
+    Returns
+    -------
+    dict[str, OpeningTrade]
+        ``{symbol: OpeningTrade}`` for each option symbol with at least
+        one opening trade.
+    """
+    from xml.etree import ElementTree as ET
+
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        logger.exception("Failed to parse Flex Query XML for opening trades")
+        return {}
+
+    earliest: dict[str, OpeningTrade] = {}
+    for trade in root.iter("Trade"):
+        if trade.get("assetCategory", "") != "OPT":
+            continue
+        indicator = trade.get("openCloseIndicator", "")
+        if indicator not in _OPEN_INDICATORS:
+            continue
+
+        symbol = trade.get("symbol", "").strip()
+        underlying = trade.get("underlyingSymbol", "").strip().upper()
+        if not symbol or not underlying:
+            continue
+
+        dt_str = (
+            trade.get("tradeDateTime")
+            or trade.get("dateTime")
+            or trade.get("orderTime")
+            or ""
+        )
+        trade_dt = _parse_trade_datetime(dt_str)
+        if trade_dt is None:
+            # Fall back to tradeDate at market open if no time is given.
+            date_str = trade.get("tradeDate", "")
+            if date_str:
+                try:
+                    trade_date = datetime.datetime.strptime(
+                        date_str, "%Y%m%d",
+                    ).date()
+                except ValueError:
+                    try:
+                        trade_date = datetime.date.fromisoformat(date_str)
+                    except ValueError:
+                        logger.warning(
+                            "Trade %s missing parseable date — skipping",
+                            trade.get("tradeID", "?"),
+                        )
+                        continue
+                trade_dt = datetime.datetime.combine(
+                    trade_date, datetime.time(9, 30), tzinfo=_ET,
+                )
+            else:
+                continue
+
+        try:
+            trade_price = float(trade.get("tradePrice", "0"))
+            quantity = int(float(trade.get("quantity", "0")))
+        except (ValueError, TypeError):
+            continue
+        if trade_price <= 0:
+            continue
+
+        candidate = OpeningTrade(
+            symbol=symbol,
+            underlying=underlying,
+            trade_datetime=trade_dt,
+            trade_price=trade_price,
+            quantity=quantity,
+        )
+        existing = earliest.get(symbol)
+        if existing is None or candidate.trade_datetime < existing.trade_datetime:
+            earliest[symbol] = candidate
+
+    logger.info("Extracted %d opening trade(s) from Flex Query", len(earliest))
+    return earliest
+
+
 def parse_flex_report(xml_content: str) -> FlexReport:
     """Parse a Flex Query XML response into a FlexReport.
 
@@ -289,6 +415,7 @@ def parse_flex_report(xml_content: str) -> FlexReport:
         when_generated=when_generated,
         positions=parse_flex_xml(xml_content),
         losses=extract_losses(xml_content),
+        opening_trades=extract_opening_trades(xml_content),
     )
 
 

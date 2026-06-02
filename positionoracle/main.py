@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 
-from positionoracle import auth, beta, db, flex, gex, massive
+from positionoracle import auth, beta, db, flex, fred, gex, massive, vrp
 from positionoracle.advisor import build_portfolio_summary
 from positionoracle.config import Settings, get_settings
 from positionoracle.greeks import compute_greeks_from_massive
@@ -36,7 +36,9 @@ from positionoracle.types import (
     ContractType,
     GEXProfile,
     Greeks,
+    OpeningTrade,
     Position,
+    PositionEntry,
     PositionGreeks,
 )
 from positionoracle.ws import ConnectionManager
@@ -67,6 +69,12 @@ _underlying_prices: dict[str, float] = {}
 _position_greeks: dict[str, PositionGreeks] = {}
 _positions: list[Position] = []
 _blacklist: list[BlacklistEntry] = []
+_position_entries: dict[str, PositionEntry] = {}
+# Recent daily closes per underlying for VRP realized-vol computation.
+# Refreshed alongside the snapshot loop. Closes are oldest-first.
+_underlying_closes: dict[str, list[float]] = {}
+# ISO date of the most recent refresh per underlying.
+_underlying_closes_date: dict[str, str] = {}
 _last_report_generated: str | None = None
 _snapshot_task: asyncio.Task[None] | None = None
 _beta_task: asyncio.Task[None] | None = None
@@ -191,6 +199,82 @@ async def _init_position_greeks() -> None:
             )
 
 
+def _apply_vrp_to_position(pg: PositionGreeks) -> None:
+    """Attach VRP / entry_iv / rv to a single PositionGreeks instance.
+
+    Reads from the in-memory caches ``_position_entries`` and
+    ``_underlying_closes``. Fields are set to ``None`` when inputs are
+    unavailable so the frontend can render a dash.
+    """
+    pos = pg.position
+    if pos.contract_type == ContractType.STOCK:
+        pg.vrp = None
+        pg.entry_iv = None
+        pg.rv = None
+        pg.rv_window_days = 0
+        return
+
+    entry = _position_entries.get(pos.symbol)
+    closes = _underlying_closes.get(pos.underlying, [])
+
+    pg.entry_iv = entry.entry_iv if entry else None
+
+    if len(closes) < 2:
+        pg.rv = None
+        pg.rv_window_days = 0
+        pg.vrp = None
+        return
+
+    rv = vrp.realized_vol_annualized(closes, window=vrp.DEFAULT_RV_WINDOW)
+    if rv != rv:  # NaN
+        pg.rv = None
+        pg.rv_window_days = 0
+        pg.vrp = None
+        return
+
+    pg.rv = rv
+    pg.rv_window_days = min(len(closes) - 1, vrp.DEFAULT_RV_WINDOW)
+
+    if entry and entry.entry_iv:
+        ratio = vrp.vrp_ratio(rv, entry.entry_iv)
+        pg.vrp = None if ratio != ratio else ratio
+    else:
+        pg.vrp = None
+
+
+async def _refresh_underlying_closes() -> None:
+    """Refresh trailing daily-close caches needed for VRP.
+
+    Pulls ~30 calendar days of daily bars per underlying so we have
+    enough trading-day closes for a trailing-21 RV. Skips tickers
+    already refreshed today.
+    """
+    global http_client
+
+    if not settings.massive_api_key or not _positions:
+        return
+    if http_client is None:
+        http_client = httpx.AsyncClient(timeout=30)
+
+    today_iso = datetime.date.today().isoformat()
+    underlyings = {
+        p.underlying for p in _positions if p.contract_type != ContractType.STOCK
+    }
+    for ticker in underlyings:
+        if _underlying_closes_date.get(ticker) == today_iso:
+            continue
+        bars = await massive.get_daily_bars(
+            settings.massive_api_key, ticker, days=30, client=http_client,
+        )
+        closes = [float(b["c"]) for b in bars if b.get("c")]
+        if len(closes) >= 2:
+            _underlying_closes[ticker] = closes
+            _underlying_closes_date[ticker] = today_iso
+            logger.info("VRP closes for %s: %d bars cached", ticker, len(closes))
+        else:
+            logger.warning("VRP closes for %s: insufficient data", ticker)
+
+
 async def _recompute_positions(underlying: str | None = None) -> None:
     """Recompute Greeks and broadcast updates.
 
@@ -206,8 +290,10 @@ async def _recompute_positions(underlying: str | None = None) -> None:
 
     for pos in positions:
         pg = _position_greeks.get(pos.symbol)
-        if pg and pos.underlying in _underlying_prices:
-            pg.underlying_price = _underlying_prices[pos.underlying]
+        if pg:
+            if pos.underlying in _underlying_prices:
+                pg.underlying_price = _underlying_prices[pos.underlying]
+            _apply_vrp_to_position(pg)
 
     if manager.has_connections:
         thresholds = await db.get_thresholds(settings.data_dir)
@@ -459,6 +545,10 @@ async def _refresh_options_snapshots() -> None:
     if http_client is None:
         http_client = httpx.AsyncClient(timeout=30)
 
+    # Refresh daily closes used for VRP realized-vol. Cheap when
+    # already cached for today; one Massive call per ticker otherwise.
+    await _refresh_underlying_closes()
+
     r = 0.05  # Approximate risk-free rate
 
     # Fetch underlying prices — always during market hours, only if missing otherwise.
@@ -618,6 +708,10 @@ def _serialize_summaries(summaries: dict[str, Any]) -> dict[str, Any]:
                 "underlying_price": pg.underlying_price,
                 "option_mid": pg.option_mid,
                 "greeks": dataclasses.asdict(pg.greeks),
+                "vrp": pg.vrp,
+                "entry_iv": pg.entry_iv,
+                "rv": pg.rv,
+                "rv_window_days": pg.rv_window_days,
             })
 
         advice_data = [dataclasses.asdict(a) for a in summary.advice]
@@ -699,10 +793,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     await db.init_db(settings.data_dir)
     await _reload_positions()
     await _reload_blacklist()
+    await _reload_position_entries()
     logger.info(
-        "Loaded %d positions and %d blacklist entries from database",
+        "Loaded %d positions, %d blacklist entries, %d entry-data records",
         len(_positions),
         len(_blacklist),
+        len(_position_entries),
     )
 
     # Load cached betas
@@ -912,6 +1008,8 @@ async def import_positions(request: Request, file: UploadFile) -> JSONResponse:
     await db.bulk_upsert_blacklist(settings.data_dir, report.losses)
     await _reload_positions()
     await _reload_blacklist()
+    await _reload_position_entries()
+    await _backfill_entry_data(report.opening_trades)
 
     await _init_position_greeks()
     await _recompute_positions()
@@ -951,6 +1049,152 @@ def _expected_latest_report_date(now_et: datetime.datetime) -> datetime.date:
     return today
 
 
+def _entry_premium_per_share(pos: Position) -> float:
+    """Per-share entry premium derived from cost basis.
+
+    Cost basis is weighted across all opening lots, so this stays
+    accurate for averaged-in positions. Always positive.
+    """
+    if pos.quantity == 0 or pos.multiplier == 0:
+        return 0.0
+    return abs(pos.cost_basis) / (abs(pos.quantity) * pos.multiplier)
+
+
+async def _compute_position_entry(
+    pos: Position,
+    open_trade: OpeningTrade | None,
+    *,
+    client: httpx.AsyncClient,
+) -> PositionEntry | None:
+    """Resolve entry spot/IV/rate for a single option position.
+
+    Returns ``None`` if any required data is missing (no opening trade,
+    no minute bar, no FRED key, etc.).
+    """
+    if pos.contract_type == ContractType.STOCK:
+        return None
+    if open_trade is None:
+        logger.warning(
+            "VRP backfill: no opening trade for %s — skipping", pos.symbol,
+        )
+        return None
+
+    entry_time = open_trade.trade_datetime
+    trade_day = entry_time.date().isoformat()
+
+    bars = await massive.get_minute_bars(
+        settings.massive_api_key, pos.underlying, trade_day, client=client,
+    )
+    if not bars:
+        logger.warning(
+            "VRP backfill: no 1-min bars for %s on %s — skipping",
+            pos.underlying, trade_day,
+        )
+        return None
+
+    target_ms = int(entry_time.astimezone(datetime.UTC).timestamp() * 1000)
+    bar = massive.pick_bar_for_minute(bars, target_ms)
+    if bar is None:
+        logger.warning(
+            "VRP backfill: no bar near %s for %s — skipping",
+            entry_time.isoformat(), pos.symbol,
+        )
+        return None
+
+    high = bar.get("h")
+    low = bar.get("l")
+    if high is None or low is None:
+        return None
+    entry_spot = (float(high) + float(low)) / 2.0
+
+    premium = _entry_premium_per_share(pos)
+    if premium <= 0:
+        logger.warning(
+            "VRP backfill: non-positive entry premium for %s — skipping", pos.symbol,
+        )
+        return None
+
+    dte_at_entry = max((pos.expiration - entry_time.date()).days, 1)
+    rate = await fred.get_rate_for_dte(
+        settings.fred_api_key, settings.data_dir, dte_at_entry, client=client,
+    )
+
+    t_years = dte_at_entry / 365.0
+    iv = vrp.implied_vol(
+        market_price=premium,
+        s=entry_spot,
+        k=pos.strike,
+        t=t_years,
+        r=rate,
+        contract_type=pos.contract_type,
+    )
+    entry_iv: float | None = None if iv is None or iv != iv else iv  # NaN check
+
+    return PositionEntry(
+        symbol=pos.symbol,
+        underlying=pos.underlying,
+        entry_time=entry_time,
+        entry_spot=entry_spot,
+        entry_premium_per_share=premium,
+        entry_iv=entry_iv,
+        entry_rate=rate,
+        computed_at=datetime.datetime.now(tz=datetime.UTC),
+    )
+
+
+async def _backfill_entry_data(opening_trades: dict[str, OpeningTrade]) -> None:
+    """Compute entry data for any open option positions that lack a cache row.
+
+    Idempotent: positions already present in ``_position_entries`` are
+    skipped. Orphan rows (positions no longer open) are pruned.
+    """
+    global http_client, _position_entries
+
+    if not settings.massive_api_key:
+        logger.info("VRP backfill skipped — Massive API key not configured")
+        return
+
+    if http_client is None:
+        http_client = httpx.AsyncClient(timeout=30)
+
+    need_backfill = [
+        p for p in _positions
+        if p.contract_type != ContractType.STOCK
+        and p.symbol not in _position_entries
+    ]
+    if not need_backfill:
+        logger.info("VRP backfill: nothing to do (%d cached)", len(_position_entries))
+    else:
+        logger.info("VRP backfill: %d position(s) to process", len(need_backfill))
+
+    for pos in need_backfill:
+        try:
+            entry = await _compute_position_entry(
+                pos, opening_trades.get(pos.symbol), client=http_client,
+            )
+        except Exception:
+            logger.exception("VRP backfill failed for %s", pos.symbol)
+            continue
+        if entry is None:
+            continue
+        await db.upsert_position_entry(settings.data_dir, entry)
+        _position_entries[pos.symbol] = entry
+        logger.info(
+            "VRP backfill: %s entry_spot=%.2f premium=%.4f iv=%s rate=%.4f",
+            pos.symbol,
+            entry.entry_spot,
+            entry.entry_premium_per_share,
+            f"{entry.entry_iv:.4f}" if entry.entry_iv is not None else "nan",
+            entry.entry_rate,
+        )
+
+    keep = {p.symbol for p in _positions if p.contract_type != ContractType.STOCK}
+    pruned = await db.delete_position_entries_not_in(settings.data_dir, keep)
+    if pruned:
+        logger.info("VRP backfill: pruned %d orphan entry row(s)", pruned)
+        _position_entries = await db.load_position_entries(settings.data_dir)
+
+
 async def _reload_positions() -> None:
     """Delete expired options and refresh ``_positions`` from the DB.
 
@@ -969,6 +1213,12 @@ async def _reload_positions() -> None:
     _last_report_generated = await db.get_setting(
         settings.data_dir, _FLEX_REPORT_DATE_KEY,
     )
+
+
+async def _reload_position_entries() -> None:
+    """Refresh ``_position_entries`` from the DB."""
+    global _position_entries
+    _position_entries = await db.load_position_entries(settings.data_dir)
 
 
 async def _reload_blacklist() -> None:
@@ -1124,6 +1374,8 @@ async def fetch_positions(
     await db.bulk_upsert_blacklist(settings.data_dir, report.losses)
     await _reload_positions()
     await _reload_blacklist()
+    await _reload_position_entries()
+    await _backfill_entry_data(report.opening_trades)
 
     await _init_position_greeks()
     await _recompute_positions()

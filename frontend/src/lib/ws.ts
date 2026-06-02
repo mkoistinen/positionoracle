@@ -27,6 +27,10 @@ export interface PositionData {
 	underlying_price: number;
 	option_mid: number | null;
 	greeks: Greeks;
+	vrp: number | null;
+	entry_iv: number | null;
+	rv: number | null;
+	rv_window_days: number;
 }
 
 export interface Advice {

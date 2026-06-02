@@ -28,6 +28,9 @@ class Settings(BaseSettings):
         IB Flex Query ID.
     massive_api_key : str
         Massive (formerly Polygon) API key for market data.
+    fred_api_key : str
+        FRED API key for treasury yield lookups (used by VRP entry-IV
+        inversion).
     anthropic_api_key : str
         Anthropic API key for Claude analysis.
     claude_model : str
@@ -45,6 +48,7 @@ class Settings(BaseSettings):
     flex_token: str = ""
     query_id: str = ""
     massive_api_key: str = ""
+    fred_api_key: str = ""
     anthropic_api_key: str = ""
     claude_model: str = "claude-sonnet-4-6"
     data_dir: Path = Path("/app/data")

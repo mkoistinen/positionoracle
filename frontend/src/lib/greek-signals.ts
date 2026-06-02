@@ -182,6 +182,36 @@ export function evaluateVomma(pos: PositionData): GreekSignal {
 	}
 }
 
+/**
+ * VRP = σ_RV(trailing 21 trading days) / σ_IV(entry).
+ *
+ * For shorts, lower is better — you collected more premium than the
+ * underlying ended up realizing. For longs, higher is better.
+ */
+export function evaluateVrp(pos: PositionData): GreekSignal {
+	const vrp = pos.vrp;
+	if (vrp == null || !isFinite(vrp)) {
+		return { level: 'ok', reason: 'VRP — entry IV not yet resolved or insufficient realized-vol data.' };
+	}
+	const short = isShort(pos);
+	const entryIv = pos.entry_iv != null ? `${(pos.entry_iv * 100).toFixed(1)}%` : '—';
+	const rv = pos.rv != null ? `${(pos.rv * 100).toFixed(1)}%` : '—';
+	const window = pos.rv_window_days;
+	const tail = ` Entry IV ${entryIv}, ${window}d RV ${rv}.`;
+
+	if (short) {
+		if (vrp >= 1.0) return { level: 'danger', reason: `VRP ${vrp.toFixed(2)} (short) — realized vol exceeds the IV you were paid for at entry. The position is riskier than your premium compensates for.${tail}` };
+		if (vrp >= 0.95) return { level: 'warning', reason: `VRP ${vrp.toFixed(2)} (short) — approaching breakeven; recent RV is closing in on entry IV.${tail}` };
+		if (vrp < 0.75) return { level: 'fantastic', reason: `VRP ${vrp.toFixed(2)} (short) — RV far below entry IV. Most of the premium has been earned; candidate to close early.${tail}` };
+		return { level: 'ok', reason: `VRP ${vrp.toFixed(2)} (short) — healthy zone; you're collecting more than is being realized.${tail}` };
+	} else {
+		if (vrp <= 1.0) return { level: 'danger', reason: `VRP ${vrp.toFixed(2)} (long) — realized vol at or below entry IV. Premium decays faster than the underlying moves.${tail}` };
+		if (vrp <= 1.0526) return { level: 'warning', reason: `VRP ${vrp.toFixed(2)} (long) — only marginally above entry IV; thin compensation.${tail}` };
+		if (vrp > 1.3333) return { level: 'fantastic', reason: `VRP ${vrp.toFixed(2)} (long) — RV well above entry IV. Strongly favorable; consider taking profit.${tail}` };
+		return { level: 'ok', reason: `VRP ${vrp.toFixed(2)} (long) — healthy zone; underlying moving more than was priced in.${tail}` };
+	}
+}
+
 const STOCK_NEUTRAL: GreekSignal = { level: 'ok', reason: 'Not applicable to stock positions.' };
 
 /** Evaluate all Greeks for a position. */
@@ -199,6 +229,7 @@ export function evaluateAll(pos: PositionData): Record<string, GreekSignal> {
 			vanna: STOCK_NEUTRAL,
 			charm: STOCK_NEUTRAL,
 			vomma: STOCK_NEUTRAL,
+			vrp: STOCK_NEUTRAL,
 		};
 	}
 
@@ -210,6 +241,7 @@ export function evaluateAll(pos: PositionData): Record<string, GreekSignal> {
 		vanna: evaluateVanna(pos),
 		charm: evaluateCharm(pos),
 		vomma: evaluateVomma(pos),
+		vrp: evaluateVrp(pos),
 	};
 }
 

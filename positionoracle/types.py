@@ -75,6 +75,78 @@ class BlacklistEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class PositionEntry:
+    """Cached entry-time data for an option position.
+
+    Persisted in the ``position_entry`` table and used by the VRP
+    calculation to compare current realized vol against the IV
+    implied by the option's entry premium.
+
+    Attributes
+    ----------
+    symbol : str
+        Option contract symbol (matches ``Position.symbol``).
+    underlying : str
+        Underlying ticker.
+    entry_time : datetime.datetime
+        Aware (ET) timestamp of the opening trade.
+    entry_spot : float
+        Underlying spot at entry, taken as ``(H+L)/2`` of the 1-min
+        bar covering ``entry_time``.
+    entry_premium_per_share : float
+        Per-share option premium at entry (positive number).
+    entry_iv : float | None
+        Implied vol back-solved from the entry premium, or ``None``
+        if the inversion failed (price outside bracket).
+    entry_rate : float
+        Continuously-compounded risk-free rate used for the inversion.
+    computed_at : datetime.datetime
+        When this record was computed.
+    """
+
+    symbol: str
+    underlying: str
+    entry_time: datetime.datetime
+    entry_spot: float
+    entry_premium_per_share: float
+    entry_iv: float | None
+    entry_rate: float
+    computed_at: datetime.datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OpeningTrade:
+    """An opening trade for an option contract.
+
+    Used to anchor VRP calculations to the moment the contract was
+    written (or purchased). For multi-lot opens we keep the earliest
+    trade and rely on cost-basis-weighted premium from the
+    ``OpenPosition`` record for the per-share entry price.
+
+    Attributes
+    ----------
+    symbol : str
+        Option contract symbol (matches ``Position.symbol``).
+    underlying : str
+        Underlying ticker.
+    trade_datetime : datetime.datetime
+        Timezone-aware (America/New_York) trade timestamp.
+    trade_price : float
+        Per-share trade price for the option (the premium paid or
+        received, in dollars per share — multiply by 100 for the
+        per-contract value).
+    quantity : int
+        Signed quantity at this trade (negative for sells).
+    """
+
+    symbol: str
+    underlying: str
+    trade_datetime: datetime.datetime
+    trade_price: float
+    quantity: int
+
+
+@dataclass(frozen=True, slots=True)
 class FlexReport:
     """A parsed IB Flex Query report with metadata.
 
@@ -88,11 +160,15 @@ class FlexReport:
     losses : list[SymbolLoss]
         ``(underlying_symbol, trade_date)`` pairs for each closing
         trade with negative realized P&L. Drives the wash-sale tracker.
+    opening_trades : dict[str, OpeningTrade]
+        Earliest opening trade per option symbol. Drives the VRP
+        entry-data backfill.
     """
 
     when_generated: datetime.datetime
     positions: list[Position]
     losses: list[SymbolLoss]
+    opening_trades: dict[str, OpeningTrade] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -143,12 +219,28 @@ class PositionGreeks:
         Current price of the underlying.
     option_mid : float | None
         Mid price of the option (if available).
+    vrp : float | None
+        Volatility Risk Premium ratio sigma_RV / sigma_IV(entry).
+        ``None`` if entry data is missing or RV cannot yet be computed.
+        Below 1.0 is favorable for short positions; above 1.0 is
+        favorable for long positions.
+    entry_iv : float | None
+        The sigma_IV inverted from the entry premium -- the IV the
+        writer was compensated for.
+    rv : float | None
+        Trailing-window realized vol used for the current VRP.
+    rv_window_days : int
+        Number of trading-day returns used in the RV calculation.
     """
 
     position: Position
     greeks: Greeks
     underlying_price: float = 0.0
     option_mid: float | None = None
+    vrp: float | None = None
+    entry_iv: float | None = None
+    rv: float | None = None
+    rv_window_days: int = 0
 
 
 class AdviceLevel(Enum):

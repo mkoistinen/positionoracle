@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING
 
 import aiosqlite
 
-from positionoracle.types import BlacklistEntry, ContractType, Position
+from positionoracle.types import (
+    BlacklistEntry,
+    ContractType,
+    Position,
+    PositionEntry,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -46,6 +51,19 @@ CREATE TABLE IF NOT EXISTS blacklist (
 )
 """
 
+_CREATE_POSITION_ENTRY = """
+CREATE TABLE IF NOT EXISTS position_entry (
+    symbol TEXT PRIMARY KEY,
+    underlying TEXT NOT NULL,
+    entry_time TEXT NOT NULL,
+    entry_spot REAL NOT NULL,
+    entry_premium_per_share REAL NOT NULL,
+    entry_iv REAL,
+    entry_rate REAL NOT NULL,
+    computed_at TEXT NOT NULL
+)
+"""
+
 _WASH_SALE_WINDOW_DAYS = 30
 
 
@@ -78,6 +96,7 @@ async def init_db(data_dir: Path) -> None:
         await conn.execute(_CREATE_POSITIONS)
         await conn.execute(_CREATE_SETTINGS)
         await conn.execute(_CREATE_BLACKLIST)
+        await conn.execute(_CREATE_POSITION_ENTRY)
         await conn.commit()
     logger.info("Database initialized at %s", db_path(data_dir))
 
@@ -420,6 +439,114 @@ async def load_blacklist(data_dir: Path) -> list[BlacklistEntry]:
         )
         for row in rows
     ]
+
+
+async def upsert_position_entry(data_dir: Path, entry: PositionEntry) -> None:
+    """Insert or replace a cached entry-data record for one position.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Application data directory.
+    entry : PositionEntry
+        Entry-time data to persist.
+    """
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        await conn.execute(
+            """
+            INSERT INTO position_entry
+                (symbol, underlying, entry_time, entry_spot,
+                 entry_premium_per_share, entry_iv, entry_rate, computed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                underlying = excluded.underlying,
+                entry_time = excluded.entry_time,
+                entry_spot = excluded.entry_spot,
+                entry_premium_per_share = excluded.entry_premium_per_share,
+                entry_iv = excluded.entry_iv,
+                entry_rate = excluded.entry_rate,
+                computed_at = excluded.computed_at
+            """,
+            (
+                entry.symbol,
+                entry.underlying,
+                entry.entry_time.isoformat(),
+                entry.entry_spot,
+                entry.entry_premium_per_share,
+                entry.entry_iv,
+                entry.entry_rate,
+                entry.computed_at.isoformat(),
+            ),
+        )
+        await conn.commit()
+
+
+async def load_position_entries(data_dir: Path) -> dict[str, PositionEntry]:
+    """Return all cached ``PositionEntry`` rows keyed by symbol.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Application data directory.
+
+    Returns
+    -------
+    dict[str, PositionEntry]
+        Cached entry data, keyed by option symbol.
+    """
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM position_entry")
+        rows = await cursor.fetchall()
+
+    out: dict[str, PositionEntry] = {}
+    for row in rows:
+        out[row["symbol"]] = PositionEntry(
+            symbol=row["symbol"],
+            underlying=row["underlying"],
+            entry_time=datetime.datetime.fromisoformat(row["entry_time"]),
+            entry_spot=row["entry_spot"],
+            entry_premium_per_share=row["entry_premium_per_share"],
+            entry_iv=row["entry_iv"],
+            entry_rate=row["entry_rate"],
+            computed_at=datetime.datetime.fromisoformat(row["computed_at"]),
+        )
+    return out
+
+
+async def delete_position_entries_not_in(
+    data_dir: Path,
+    keep_symbols: set[str],
+) -> int:
+    """Remove cached entry rows whose symbol isn't in ``keep_symbols``.
+
+    Called after each position-import sync so closed positions don't
+    leave orphan rows behind. If ``keep_symbols`` is empty all rows are
+    deleted.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Application data directory.
+    keep_symbols : set[str]
+        Symbols that must remain in the table.
+
+    Returns
+    -------
+    int
+        Number of rows deleted.
+    """
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        if not keep_symbols:
+            cursor = await conn.execute("DELETE FROM position_entry")
+        else:
+            placeholders = ",".join("?" for _ in keep_symbols)
+            cursor = await conn.execute(
+                f"DELETE FROM position_entry WHERE symbol NOT IN ({placeholders})",
+                tuple(keep_symbols),
+            )
+        await conn.commit()
+        return cursor.rowcount
 
 
 async def lookup_blacklist(data_dir: Path, symbol: str) -> BlacklistEntry | None:

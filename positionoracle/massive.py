@@ -166,6 +166,108 @@ async def get_daily_bars(
 
 
 # ---------------------------------------------------------------------------
+# REST — Intraday minute bars (for VRP entry spot)
+# ---------------------------------------------------------------------------
+
+
+async def get_minute_bars(
+    api_key: str,
+    ticker: str,
+    day: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch 1-minute OHLC bars for a single trading day.
+
+    Parameters
+    ----------
+    api_key : str
+        Massive API key.
+    ticker : str
+        Stock ticker (e.g. ``"AAPL"``).
+    day : str
+        ISO date string for the trading day (``YYYY-MM-DD``).
+    client : httpx.AsyncClient | None
+        Optional shared HTTP client.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Bar dicts with keys ``t`` (epoch millis, bar start), ``o``, ``h``,
+        ``l``, ``c``, ``v``. Empty list on failure.
+    """
+    url = f"{_REST_BASE}/v2/aggs/ticker/{ticker}/range/1/minute/{day}/{day}"
+    params = {
+        "apiKey": api_key,
+        "adjusted": "true",
+        "sort": "asc",
+        "limit": "50000",
+    }
+
+    close_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=30)
+
+    try:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("results", []) or []
+    except httpx.HTTPStatusError:
+        logger.exception("Failed to fetch 1-min bars for %s on %s", ticker, day)
+        return []
+    finally:
+        if close_client:
+            await client.aclose()
+
+
+def pick_bar_for_minute(
+    bars: list[dict[str, Any]],
+    target_epoch_ms: int,
+    *,
+    tolerance_minutes: int = 5,
+) -> dict[str, Any] | None:
+    """Return the bar covering ``target_epoch_ms`` (±tolerance).
+
+    Bars are indexed by start time. We first look for the bar that
+    contains the target (``t <= target < t + 60_000``); if none matches
+    exactly we widen the search to the nearest bar within
+    ``tolerance_minutes``.
+
+    Parameters
+    ----------
+    bars : list[dict[str, Any]]
+        Bars in ascending time order, as returned by
+        :func:`get_minute_bars`.
+    target_epoch_ms : int
+        Target time (UTC epoch milliseconds).
+    tolerance_minutes : int
+        Maximum acceptable distance from the target.
+
+    Returns
+    -------
+    dict[str, Any] | None
+        Matching bar or ``None`` if nothing falls within tolerance.
+    """
+    if not bars:
+        return None
+    one_minute_ms = 60_000
+    best: dict[str, Any] | None = None
+    best_dist = tolerance_minutes * one_minute_ms + 1
+    for bar in bars:
+        t = bar.get("t")
+        if t is None:
+            continue
+        if t <= target_epoch_ms < t + one_minute_ms:
+            return bar
+        dist = abs(t - target_epoch_ms)
+        if dist < best_dist:
+            best_dist = dist
+            best = bar
+    return best
+
+
+# ---------------------------------------------------------------------------
 # REST — Options chain snapshot (for GEX)
 # ---------------------------------------------------------------------------
 

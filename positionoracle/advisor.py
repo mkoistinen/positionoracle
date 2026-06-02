@@ -13,6 +13,100 @@ from positionoracle.types import (
     PositionGreeks,
 )
 
+# VRP alert band edges. Reciprocal-symmetric in log space so short
+# and long thresholds mirror around 1.0.
+_VRP_INFO_LOW = 0.75   # Short candidate-to-close
+_VRP_WARN_LOW = 0.95   # Short approaching wrong side
+_VRP_WARN_HIGH = 1.0 / _VRP_WARN_LOW   # ≈ 1.0526
+_VRP_INFO_HIGH = 1.0 / _VRP_INFO_LOW   # ≈ 1.3333
+
+
+def _evaluate_vrp(pg: PositionGreeks) -> list[Advice]:
+    """Generate VRP-based advice for a single option position.
+
+    Bands (short positions, mirrored for longs):
+
+    - VRP ≥ 1.0  → URGENT (realized vol exceeds the IV paid for at entry)
+    - 0.95 ≤ VRP < 1.0  → WARNING (margin tightening)
+    - 0.75 ≤ VRP < 0.95 → silent (healthy zone)
+    - VRP < 0.75 → INFO (deep margin; candidate to close early)
+
+    For long positions the bands flip around 1.0.
+    """
+    if pg.vrp is None:
+        return []
+    vrp_val = pg.vrp
+    pos = pg.position
+    is_short = pos.quantity < 0
+    side = "short" if is_short else "long"
+
+    if is_short:
+        if vrp_val >= 1.0:
+            level, msg = (
+                AdviceLevel.URGENT,
+                (
+                    f"VRP {vrp_val:.2f} (short) — realized vol is exceeding "
+                    f"the IV you were paid at entry. The position is riskier "
+                    f"than your premium compensates for."
+                ),
+            )
+        elif vrp_val >= _VRP_WARN_LOW:
+            level, msg = (
+                AdviceLevel.WARNING,
+                (
+                    f"VRP {vrp_val:.2f} (short) — approaching breakeven; "
+                    f"recent realized vol is closing in on entry IV."
+                ),
+            )
+        elif vrp_val < _VRP_INFO_LOW:
+            level, msg = (
+                AdviceLevel.INFO,
+                (
+                    f"VRP {vrp_val:.2f} (short) — realized vol is far below "
+                    f"entry IV. Most of the premium has been earned; this is "
+                    f"a candidate to close early."
+                ),
+            )
+        else:
+            return []
+    else:
+        if vrp_val <= 1.0:
+            level, msg = (
+                AdviceLevel.URGENT,
+                (
+                    f"VRP {vrp_val:.2f} (long) — realized vol is at or below "
+                    f"the IV paid at entry. The premium is decaying faster "
+                    f"than the underlying is moving."
+                ),
+            )
+        elif vrp_val <= _VRP_WARN_HIGH:
+            level, msg = (
+                AdviceLevel.WARNING,
+                (
+                    f"VRP {vrp_val:.2f} (long) — only marginally above "
+                    f"entry IV; thin compensation for the long premium."
+                ),
+            )
+        elif vrp_val > _VRP_INFO_HIGH:
+            level, msg = (
+                AdviceLevel.INFO,
+                (
+                    f"VRP {vrp_val:.2f} (long) — realized vol is well above "
+                    f"entry IV. Strongly favorable; consider taking profit."
+                ),
+            )
+        else:
+            return []
+
+    return [Advice(
+        level=level,
+        message=msg,
+        position_symbol=pos.symbol,
+        metric=f"vrp_{side}",
+        value=vrp_val,
+        threshold=1.0,
+    )]
+
 
 def evaluate_position(
     pg: PositionGreeks,
@@ -116,6 +210,12 @@ def evaluate_position(
             value=g.vega,
             threshold=vega_warn,
         ))
+
+    # Volatility Risk Premium — realized vol vs entry-implied vol.
+    # Short positions: VRP > 1 = realizing more than was priced in (bad).
+    # Long positions: VRP < 1 = realizing less than was priced in (bad).
+    if pg.vrp is not None and pg.entry_iv:
+        advice.extend(_evaluate_vrp(pg))
 
     # Charm warning — delta shifting fast with time
     if abs(g.charm) > 0.01:
