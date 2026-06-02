@@ -12,6 +12,9 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
 		...options,
 		credentials: 'same-origin'
 	});
+	if (response.status === 401) {
+		window.dispatchEvent(new Event('po:unauthorized'));
+	}
 	if (!response.ok) {
 		const text = await response.text();
 		throw new Error(`${response.status}: ${text}`);

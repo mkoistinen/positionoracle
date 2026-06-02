@@ -129,7 +129,16 @@
 
 	let ws: PortfolioWebSocket | null = null;
 
+	function handleUnauthorized() {
+		if (!authenticated) return;
+		authenticated = false;
+		ws?.disconnect();
+		underlyings = {};
+		importMessage = '';
+	}
+
 	onMount(async () => {
+		window.addEventListener('po:unauthorized', handleUnauthorized);
 		try {
 			const status = await getAuthStatus();
 			authenticated = status.authenticated;
@@ -150,6 +159,7 @@
 	});
 
 	onDestroy(() => {
+		window.removeEventListener('po:unauthorized', handleUnauthorized);
 		ws?.disconnect();
 	});
 
