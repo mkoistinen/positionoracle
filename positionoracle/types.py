@@ -218,7 +218,20 @@ class PositionGreeks:
     underlying_price : float
         Current price of the underlying.
     option_mid : float | None
-        Mid price of the option (if available).
+        Mid price from quotes (if available; bid/ask may be absent on
+        delayed/Greeks-only Massive tiers).
+    theoretical_mid : float | None
+        Black-Scholes theoretical price computed from the current spot,
+        live IV, time to expiration, and rate. Always populated when
+        the inputs are valid; used as the canonical "current value"
+        for P&L computation since quote-based mid is tier-dependent.
+    pnl_pct : float | None
+        Direction-aware P&L as a fraction of the entry premium per
+        share. Positive = position is up; negative = down. For shorts:
+        ``(entry_premium - current_value) / entry_premium``. For longs:
+        ``(current_value - entry_premium) / entry_premium``. ``None``
+        when ``entry_premium_per_share`` or the theoretical mid is
+        unavailable.
     vrp : float | None
         Volatility Risk Premium ratio sigma_RV / sigma_IV(entry).
         ``None`` if entry data is missing or RV cannot yet be computed.
@@ -237,6 +250,8 @@ class PositionGreeks:
     greeks: Greeks
     underlying_price: float = 0.0
     option_mid: float | None = None
+    theoretical_mid: float | None = None
+    pnl_pct: float | None = None
     vrp: float | None = None
     entry_iv: float | None = None
     rv: float | None = None

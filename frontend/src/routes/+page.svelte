@@ -584,6 +584,7 @@
 									<th use:tooltip={'Strike — Contract strike price.'}>Strike</th>
 									<th use:tooltip={'Expiration — Contract expiration date.'}>Exp</th>
 									<th use:tooltip={'Quantity — Number of contracts (negative = short).'}>Qty</th>
+									<th use:tooltip={'P&L % — Direction-aware profit/loss as a fraction of entry premium, using a Black-Scholes theoretical mid from live IV. For shorts, positive = premium decaying in your favor; 80%+ is candidate-to-close territory.'}>P&amp;L %</th>
 									<th use:tooltip={'Implied Volatility — Annualized vol the market is currently pricing into this contract.'}>IV</th>
 									<th use:tooltip={'VRP — Volatility Risk Premium ratio: trailing 21-day realized vol divided by the IV implied by your entry premium. Below 1.0 favors short positions; above 1.0 favors long positions.'}>VRP</th>
 									<th use:tooltip={'Delta — Change in option price per $1 move in the underlying (per contract).'}>&Delta;</th>
@@ -604,6 +605,9 @@
 										<td>{isStock ? '—' : formatPrice(pos.strike)}</td>
 										<td>{isStock ? '—' : pos.expiration}</td>
 										<td class:negative={pos.quantity < 0}>{pos.quantity}</td>
+										<td class={signalClass(signals.pnl.level)} use:tooltip={signals.pnl.reason}>
+											{isStock || pos.pnl_pct == null ? '—' : (pos.pnl_pct * 100).toFixed(0) + '%'}
+										</td>
 										<td>{isStock ? '—' : (pos.greeks.implied_volatility * 100).toFixed(1) + '%'}</td>
 										<td class={signalClass(signals.vrp.level)} use:tooltip={signals.vrp.reason}>
 											{isStock || pos.vrp == null ? '—' : pos.vrp.toFixed(2)}

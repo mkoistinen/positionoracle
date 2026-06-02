@@ -183,7 +183,41 @@ export function evaluateVomma(pos: PositionData): GreekSignal {
 }
 
 /**
- * VRP = σ_RV(trailing 21 trading days) / σ_IV(entry).
+ * Direction-aware P&L as a fraction of entry premium.
+ *
+ * Uses the BS theoretical mid (computed from live IV) rather than
+ * quote-based mid because Massive Options Starter doesn't return
+ * bid/ask. Tooltip surfaces entry premium, current value, and what
+ * fraction of the max profit has been realized for short positions.
+ */
+export function evaluatePnlPct(pos: PositionData): GreekSignal {
+	const p = pos.pnl_pct;
+	if (p == null || !isFinite(p)) {
+		return { level: 'ok', reason: 'P&L% — entry premium not yet resolved.' };
+	}
+	const short = isShort(pos);
+	const pct = (p * 100).toFixed(0);
+	const mid = pos.theoretical_mid != null ? `$${pos.theoretical_mid.toFixed(2)}` : '—';
+	const tail = ` Theoretical mid ${mid}.`;
+
+	if (short) {
+		// For shorts, p > 0 = premium being earned. p = 1 means fully decayed.
+		if (p >= 0.80) return { level: 'fantastic', reason: `P&L ${pct}% — ${pct}% of entry premium earned. Most of the max profit is in; consider closing to free capital and shed remaining tail risk.${tail}` };
+		if (p >= 0.50) return { level: 'ok', reason: `P&L ${pct}% — over half of entry premium earned; thesis is working.${tail}` };
+		if (p >= 0) return { level: 'ok', reason: `P&L ${pct}% — premium decaying in your favor.${tail}` };
+		if (p >= -0.50) return { level: 'warning', reason: `P&L ${pct}% — position is down; current value exceeds entry premium.${tail}` };
+		return { level: 'danger', reason: `P&L ${pct}% — significant drawdown vs entry premium.${tail}` };
+	} else {
+		// For longs, p > 0 = position appreciated.
+		if (p >= 0.50) return { level: 'fantastic', reason: `P&L ${pct}% — substantial gain vs entry premium.${tail}` };
+		if (p >= 0) return { level: 'ok', reason: `P&L ${pct}% — position appreciating.${tail}` };
+		if (p >= -0.50) return { level: 'warning', reason: `P&L ${pct}% — position is down from entry; premium being eaten by theta or adverse move.${tail}` };
+		return { level: 'danger', reason: `P&L ${pct}% — large drawdown vs entry premium.${tail}` };
+	}
+}
+
+/**
+ * VRP = sigma_RV(trailing 21 trading days) / sigma_IV(entry).
  *
  * For shorts, lower is better — you collected more premium than the
  * underlying ended up realizing. For longs, higher is better.
@@ -230,6 +264,7 @@ export function evaluateAll(pos: PositionData): Record<string, GreekSignal> {
 			charm: STOCK_NEUTRAL,
 			vomma: STOCK_NEUTRAL,
 			vrp: STOCK_NEUTRAL,
+			pnl: STOCK_NEUTRAL,
 		};
 	}
 
@@ -242,6 +277,7 @@ export function evaluateAll(pos: PositionData): Record<string, GreekSignal> {
 		charm: evaluateCharm(pos),
 		vomma: evaluateVomma(pos),
 		vrp: evaluateVrp(pos),
+		pnl: evaluatePnlPct(pos),
 	};
 }
 

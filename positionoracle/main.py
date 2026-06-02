@@ -199,12 +199,16 @@ async def _init_position_greeks() -> None:
             )
 
 
-def _apply_vrp_to_position(pg: PositionGreeks) -> None:
-    """Attach VRP / entry_iv / rv to a single PositionGreeks instance.
+def _apply_derived_metrics_to_position(pg: PositionGreeks) -> None:
+    """Attach VRP / entry_iv / rv / theoretical_mid / pnl_pct to a position.
 
     Reads from the in-memory caches ``_position_entries`` and
     ``_underlying_closes``. Fields are set to ``None`` when inputs are
     unavailable so the frontend can render a dash.
+
+    P&L% uses the BS theoretical price (computed from live IV + spot)
+    rather than quote-derived mid, because the user's Massive tier
+    doesn't always return bid/ask.
     """
     pos = pg.position
     if pos.contract_type == ContractType.STOCK:
@@ -212,6 +216,8 @@ def _apply_vrp_to_position(pg: PositionGreeks) -> None:
         pg.entry_iv = None
         pg.rv = None
         pg.rv_window_days = 0
+        pg.theoretical_mid = None
+        pg.pnl_pct = None
         return
 
     entry = _position_entries.get(pos.symbol)
@@ -219,6 +225,42 @@ def _apply_vrp_to_position(pg: PositionGreeks) -> None:
 
     pg.entry_iv = entry.entry_iv if entry else None
 
+    # --- Theoretical mid via Black-Scholes from live IV ---
+    dte = (pos.expiration - datetime.date.today()).days
+    if (
+        pg.underlying_price > 0
+        and pg.greeks.implied_volatility > 0
+        and dte > 0
+    ):
+        t_years = max(dte / 365.0, 1 / 365.0)
+        rate = entry.entry_rate if entry else 0.05
+        pg.theoretical_mid = vrp.bs_price(
+            s=pg.underlying_price,
+            k=pos.strike,
+            t=t_years,
+            r=rate,
+            sigma=pg.greeks.implied_volatility,
+            contract_type=pos.contract_type,
+        )
+    else:
+        pg.theoretical_mid = None
+
+    # --- P&L% (direction-aware, anchored to entry premium) ---
+    if (
+        entry
+        and entry.entry_premium_per_share > 0
+        and pg.theoretical_mid is not None
+    ):
+        current = pg.theoretical_mid
+        entry_prem = entry.entry_premium_per_share
+        if pos.quantity < 0:
+            pg.pnl_pct = (entry_prem - current) / entry_prem
+        else:
+            pg.pnl_pct = (current - entry_prem) / entry_prem
+    else:
+        pg.pnl_pct = None
+
+    # --- VRP ---
     if len(closes) < 2:
         pg.rv = None
         pg.rv_window_days = 0
@@ -293,7 +335,7 @@ async def _recompute_positions(underlying: str | None = None) -> None:
         if pg:
             if pos.underlying in _underlying_prices:
                 pg.underlying_price = _underlying_prices[pos.underlying]
-            _apply_vrp_to_position(pg)
+            _apply_derived_metrics_to_position(pg)
 
     if manager.has_connections:
         thresholds = await db.get_thresholds(settings.data_dir)
@@ -707,6 +749,8 @@ def _serialize_summaries(summaries: dict[str, Any]) -> dict[str, Any]:
                 "multiplier": pos.multiplier,
                 "underlying_price": pg.underlying_price,
                 "option_mid": pg.option_mid,
+                "theoretical_mid": pg.theoretical_mid,
+                "pnl_pct": pg.pnl_pct,
                 "greeks": dataclasses.asdict(pg.greeks),
                 "vrp": pg.vrp,
                 "entry_iv": pg.entry_iv,

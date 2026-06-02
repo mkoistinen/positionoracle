@@ -26,6 +26,8 @@ export interface PositionData {
 	multiplier: number;
 	underlying_price: number;
 	option_mid: number | null;
+	theoretical_mid: number | null;
+	pnl_pct: number | null;
 	greeks: Greeks;
 	vrp: number | null;
 	entry_iv: number | null;
