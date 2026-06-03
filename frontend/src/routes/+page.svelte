@@ -232,6 +232,8 @@
 				handleFetchFromIB(false);
 				if (activeTab === 'washsale') {
 					loadBlacklist();
+				} else if (activeTab === 'apikeys') {
+					loadApiKeys();
 				}
 			}
 		} catch (e) {
