@@ -282,6 +282,31 @@
 	let isDragging = $state(false);
 	let importing = $state(false);
 	let dragCounter = 0;
+	let uploadDialog: HTMLDialogElement | undefined = $state();
+	let uploadDialogFile = $state<File | null>(null);
+
+	function openUploadDialog() {
+		uploadDialogFile = null;
+		uploadDialog?.showModal();
+	}
+
+	function closeUploadDialog() {
+		uploadDialog?.close();
+		uploadDialogFile = null;
+	}
+
+	function handleUploadFileChange(event: Event) {
+		const input = event.target as HTMLInputElement;
+		uploadDialogFile = input.files?.[0] ?? null;
+	}
+
+	async function handleUploadSubmit(event: SubmitEvent) {
+		event.preventDefault();
+		if (!uploadDialogFile || importing) return;
+		const file = uploadDialogFile;
+		closeUploadDialog();
+		await importFile(file);
+	}
 
 	async function importFile(file: File) {
 		if (importing) return;
@@ -471,6 +496,34 @@
 		</div>
 	</div>
 {/if}
+
+<dialog bind:this={uploadDialog} class="upload-dialog">
+	<form method="dialog" class="upload-dialog-form" onsubmit={handleUploadSubmit}>
+		<h3>Upload Flex Report</h3>
+		<p class="muted">
+			Select an IB Flex Query XML file. This replaces your current
+			position set with the file's contents.
+		</p>
+		<input
+			type="file"
+			accept=".xml,application/xml,text/xml"
+			onchange={handleUploadFileChange}
+			required
+		/>
+		<div class="upload-dialog-actions">
+			<button type="button" class="upload-cancel" onclick={closeUploadDialog}>
+				Cancel
+			</button>
+			<button
+				type="submit"
+				class="upload-submit"
+				disabled={!uploadDialogFile || importing}
+			>
+				{importing ? 'Uploading…' : 'Upload'}
+			</button>
+		</div>
+	</form>
+</dialog>
 
 {#if loading}
 	<div class="center">Loading...</div>
@@ -748,6 +801,12 @@
 		{#if lastReportGenerated}
 			<div class="last-import">
 				Report generated: {formatReportTimestamp(lastReportGenerated)}
+				<span class="last-import-sep">·</span>
+				<button
+					type="button"
+					class="text-link"
+					onclick={openUploadDialog}
+				>Upload new report</button>
 			</div>
 		{/if}
 	</main>
@@ -829,6 +888,12 @@
 		{#if lastReportGenerated}
 			<div class="last-import">
 				Report generated: {formatReportTimestamp(lastReportGenerated)}
+				<span class="last-import-sep">·</span>
+				<button
+					type="button"
+					class="text-link"
+					onclick={openUploadDialog}
+				>Upload new report</button>
 			</div>
 		{/if}
 	</main>
@@ -1073,6 +1138,124 @@
 		font-size: 0.8125rem;
 		padding: 1.25rem 0 0.5rem;
 		font-variant-numeric: tabular-nums;
+	}
+
+	.last-import-sep {
+		margin: 0 0.4rem;
+		color: #475569;
+	}
+
+	.text-link {
+		background: none;
+		border: none;
+		padding: 0;
+		font: inherit;
+		color: #60a5fa;
+		text-decoration: underline;
+		cursor: pointer;
+	}
+
+	.text-link:hover {
+		color: #93c5fd;
+	}
+
+	.upload-dialog {
+		border: 1px solid #334155;
+		border-radius: 8px;
+		background: #1e293b;
+		color: #e2e8f0;
+		padding: 0;
+		max-width: 480px;
+		width: calc(100% - 2rem);
+	}
+
+	.upload-dialog::backdrop {
+		background: rgba(0, 0, 0, 0.6);
+	}
+
+	.upload-dialog-form {
+		padding: 1.5rem;
+		display: flex;
+		flex-direction: column;
+		gap: 1rem;
+	}
+
+	.upload-dialog-form h3 {
+		margin: 0;
+		color: #f1f5f9;
+		font-size: 1.1rem;
+	}
+
+	.upload-dialog-form .muted {
+		margin: 0;
+		color: #94a3b8;
+		font-size: 0.9rem;
+		line-height: 1.5;
+	}
+
+	.upload-dialog-form input[type='file'] {
+		padding: 0.5rem;
+		background: #0f172a;
+		border: 1px solid #334155;
+		border-radius: 4px;
+		color: #cbd5e1;
+		font-size: 0.9rem;
+	}
+
+	.upload-dialog-form input[type='file']::file-selector-button {
+		margin-right: 0.75rem;
+		padding: 0.35rem 0.75rem;
+		background: #334155;
+		border: none;
+		border-radius: 3px;
+		color: #e2e8f0;
+		font-size: 0.85rem;
+		cursor: pointer;
+	}
+
+	.upload-dialog-form input[type='file']::file-selector-button:hover {
+		background: #475569;
+	}
+
+	.upload-dialog-actions {
+		display: flex;
+		gap: 0.5rem;
+		justify-content: flex-end;
+	}
+
+	.upload-cancel,
+	.upload-submit {
+		padding: 0.5rem 1rem;
+		border-radius: 4px;
+		font-size: 0.9rem;
+		cursor: pointer;
+		font-weight: 600;
+	}
+
+	.upload-cancel {
+		background: transparent;
+		border: 1px solid #475569;
+		color: #cbd5e1;
+	}
+
+	.upload-cancel:hover {
+		background: #334155;
+	}
+
+	.upload-submit {
+		background: #2563eb;
+		border: none;
+		color: white;
+	}
+
+	.upload-submit:hover:not(:disabled) {
+		background: #1d4ed8;
+	}
+
+	.upload-submit:disabled {
+		background: #334155;
+		color: #94a3b8;
+		cursor: not-allowed;
 	}
 
 	.drop-overlay {
