@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout, refreshGex, getBlacklist, type BlacklistEntry } from '$lib/api';
+	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout, refreshGex, getBlacklist, listApiKeys, createApiKey, deleteApiKey, type BlacklistEntry, type ApiKeyListItem, type ApiKeyCreated } from '$lib/api';
 	import { PortfolioWebSocket, type PortfolioUpdate, type PortfolioRollup, type UnderlyingSummary, type GEXProfile } from '$lib/ws';
 	import { evaluateAll, evaluateNetDelta, evaluateNetTheta, evaluateNetVega, evaluateNetGamma, evaluateBetaWeightedDelta, signalClass } from '$lib/greek-signals';
 	import { tooltip } from '$lib/tooltip';
@@ -27,6 +27,13 @@
 	let analyses = $state<Record<string, string>>({});
 	let analyzing = $state<Record<string, boolean>>({});
 	let analysisVisible = $state<Record<string, boolean>>({});
+	let apiKeys = $state<ApiKeyListItem[]>([]);
+	let apiKeysLoading = $state(false);
+	let apiKeysError = $state('');
+	let newApiKeyName = $state('');
+	let creatingApiKey = $state(false);
+	let recentlyCreatedKey = $state<ApiKeyCreated | null>(null);
+	let copyKeySuccess = $state(false);
 
 	async function handleClaude(ticker: string, event: MouseEvent) {
 		event.stopPropagation();
@@ -53,13 +60,13 @@
 		}
 	}
 
-	type Tab = 'greeks' | 'washsale';
+	type Tab = 'greeks' | 'washsale' | 'apikeys';
 	const TAB_KEY = 'po_active_tab';
 
 	function loadActiveTab(): Tab {
 		try {
 			const raw = localStorage.getItem(TAB_KEY);
-			if (raw === 'greeks' || raw === 'washsale') return raw;
+			if (raw === 'greeks' || raw === 'washsale' || raw === 'apikeys') return raw;
 		} catch {
 			// ignore
 		}
@@ -77,6 +84,82 @@
 		}
 		if (tab === 'washsale') {
 			loadBlacklist();
+		} else if (tab === 'apikeys') {
+			loadApiKeys();
+		}
+	}
+
+	async function loadApiKeys() {
+		if (!authenticated) return;
+		apiKeysLoading = true;
+		apiKeysError = '';
+		try {
+			const result = await listApiKeys();
+			apiKeys = result.keys;
+		} catch (e) {
+			apiKeysError = `Failed to load API keys: ${e}`;
+		} finally {
+			apiKeysLoading = false;
+		}
+	}
+
+	async function handleCreateApiKey(event: SubmitEvent) {
+		event.preventDefault();
+		const name = newApiKeyName.trim();
+		if (!name || creatingApiKey) return;
+		creatingApiKey = true;
+		apiKeysError = '';
+		try {
+			const created = await createApiKey(name);
+			recentlyCreatedKey = created;
+			newApiKeyName = '';
+			await loadApiKeys();
+		} catch (e) {
+			apiKeysError = `Failed to create API key: ${e}`;
+		} finally {
+			creatingApiKey = false;
+		}
+	}
+
+	async function handleRevokeApiKey(key: ApiKeyListItem) {
+		const ok = confirm(
+			`Revoke "${key.name}" (${key.key_prefix}…)?\n\n` +
+			'Any process using this key will lose access immediately.'
+		);
+		if (!ok) return;
+		try {
+			await deleteApiKey(key.id);
+			if (recentlyCreatedKey?.id === key.id) {
+				recentlyCreatedKey = null;
+			}
+			await loadApiKeys();
+		} catch (e) {
+			apiKeysError = `Failed to revoke key: ${e}`;
+		}
+	}
+
+	async function copyKeyToClipboard() {
+		if (!recentlyCreatedKey) return;
+		try {
+			await navigator.clipboard.writeText(recentlyCreatedKey.key);
+			copyKeySuccess = true;
+			setTimeout(() => { copyKeySuccess = false; }, 2000);
+		} catch (e) {
+			apiKeysError = `Copy failed: ${e}`;
+		}
+	}
+
+	function dismissCreatedKey() {
+		recentlyCreatedKey = null;
+		copyKeySuccess = false;
+	}
+
+	function formatApiKeyTimestamp(iso: string | null): string {
+		if (!iso) return '—';
+		try {
+			return new Date(iso).toLocaleString();
+		} catch {
+			return iso;
 		}
 	}
 
@@ -450,6 +533,15 @@
 		>
 			Wash-Sale Watcher
 		</button>
+		<button
+			class="tab"
+			class:tab-active={activeTab === 'apikeys'}
+			role="tab"
+			aria-selected={activeTab === 'apikeys'}
+			onclick={() => setActiveTab('apikeys')}
+		>
+			API Keys
+		</button>
 	</div>
 
 	{#if activeTab === 'greeks'}
@@ -736,6 +828,106 @@
 			<div class="last-import">
 				Report generated: {formatReportTimestamp(lastReportGenerated)}
 			</div>
+		{/if}
+	</main>
+	{:else if activeTab === 'apikeys'}
+	<main class="apikeys">
+		<div class="apikeys-header">
+			<h2>API Keys</h2>
+			<p class="muted">
+				API keys grant programmatic, read-and-write access to your positions
+				and wash-sale data via the REST API at <code>/api/v1/</code>. Send the
+				key as a Bearer token: <code>Authorization: Bearer po_…</code>.
+				Browse <a href="/docs" target="_blank" rel="noopener">/docs</a> for the
+				full API reference.
+			</p>
+		</div>
+
+		<form class="apikey-create" onsubmit={handleCreateApiKey}>
+			<input
+				type="text"
+				placeholder="Key name (e.g. reporting-server)"
+				bind:value={newApiKeyName}
+				maxlength="64"
+				autocomplete="off"
+				spellcheck="false"
+				disabled={creatingApiKey}
+			/>
+			<button
+				type="submit"
+				class="primary"
+				disabled={creatingApiKey || !newApiKeyName.trim()}
+			>
+				{creatingApiKey ? 'Generating…' : 'Generate new key'}
+			</button>
+		</form>
+
+		{#if recentlyCreatedKey}
+			<div class="apikey-revealed">
+				<div class="apikey-revealed-header">
+					<strong>{recentlyCreatedKey.name}</strong> created. Copy the key
+					below NOW — it cannot be retrieved again.
+				</div>
+				<div class="apikey-revealed-body">
+					<code class="apikey-cleartext">{recentlyCreatedKey.key}</code>
+					<button
+						type="button"
+						class="apikey-copy"
+						onclick={copyKeyToClipboard}
+					>
+						{copyKeySuccess ? 'Copied!' : 'Copy'}
+					</button>
+					<button
+						type="button"
+						class="apikey-dismiss"
+						onclick={dismissCreatedKey}
+						aria-label="Dismiss"
+					>×</button>
+				</div>
+			</div>
+		{/if}
+
+		{#if apiKeysError}
+			<div class="ws-error">{apiKeysError}</div>
+		{/if}
+
+		{#if apiKeysLoading && apiKeys.length === 0}
+			<div class="ws-empty">Loading…</div>
+		{:else if apiKeys.length === 0}
+			<div class="ws-empty">
+				No API keys yet. Generate one above to access the REST API.
+			</div>
+		{:else}
+			<table class="apikey-table">
+				<thead>
+					<tr>
+						<th>Name</th>
+						<th>Prefix</th>
+						<th>Created</th>
+						<th>Last used</th>
+						<th></th>
+					</tr>
+				</thead>
+				<tbody>
+					{#each apiKeys as key (key.id)}
+						<tr>
+							<td class="apikey-name">{key.name}</td>
+							<td><code>{key.key_prefix}…</code></td>
+							<td>{formatApiKeyTimestamp(key.created_at)}</td>
+							<td>{formatApiKeyTimestamp(key.last_used_at)}</td>
+							<td>
+								<button
+									type="button"
+									class="apikey-revoke"
+									onclick={() => handleRevokeApiKey(key)}
+								>
+									Revoke
+								</button>
+							</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
 		{/if}
 	</main>
 	{/if}
@@ -1111,6 +1303,197 @@
 	.ws-imminent {
 		color: #fca5a5;
 		font-weight: 600;
+	}
+
+	.apikeys {
+		max-width: 960px;
+		margin: 0 auto;
+		width: 100%;
+	}
+
+	.apikeys-header h2 {
+		margin: 0 0 0.5rem;
+		color: #e2e8f0;
+	}
+
+	.apikeys-header .muted {
+		color: #94a3b8;
+		font-size: 0.9rem;
+		line-height: 1.5;
+	}
+
+	.apikeys-header code {
+		background: #1e293b;
+		padding: 0.1rem 0.4rem;
+		border-radius: 3px;
+		font-size: 0.85em;
+	}
+
+	.apikeys-header a {
+		color: #93c5fd;
+	}
+
+	.apikey-create {
+		display: flex;
+		gap: 0.75rem;
+		align-items: center;
+		margin-top: 1rem;
+		padding: 1rem;
+		background: #1e293b;
+		border-radius: 6px;
+	}
+
+	.apikey-create input {
+		flex: 1;
+		padding: 0.6rem 0.8rem;
+		background: #0f172a;
+		border: 1px solid #334155;
+		border-radius: 4px;
+		color: #e2e8f0;
+		font-size: 0.95rem;
+	}
+
+	.apikey-create input:focus {
+		outline: none;
+		border-color: #60a5fa;
+	}
+
+	.apikey-create button.primary {
+		padding: 0.6rem 1.2rem;
+		background: #2563eb;
+		border: none;
+		border-radius: 4px;
+		color: white;
+		font-weight: 600;
+		cursor: pointer;
+		font-size: 0.9rem;
+	}
+
+	.apikey-create button.primary:disabled {
+		background: #334155;
+		color: #94a3b8;
+		cursor: not-allowed;
+	}
+
+	.apikey-create button.primary:not(:disabled):hover {
+		background: #1d4ed8;
+	}
+
+	.apikey-revealed {
+		margin-top: 1rem;
+		padding: 1rem;
+		background: #1c2f1c;
+		border: 1px solid #4ade80;
+		border-radius: 6px;
+		color: #bbf7d0;
+	}
+
+	.apikey-revealed-header {
+		font-size: 0.9rem;
+		margin-bottom: 0.75rem;
+	}
+
+	.apikey-revealed-body {
+		display: flex;
+		gap: 0.5rem;
+		align-items: center;
+	}
+
+	.apikey-cleartext {
+		flex: 1;
+		font-family: ui-monospace, SFMono-Regular, monospace;
+		font-size: 0.9rem;
+		padding: 0.5rem 0.75rem;
+		background: #0f172a;
+		border-radius: 4px;
+		color: #f1f5f9;
+		word-break: break-all;
+		user-select: all;
+	}
+
+	.apikey-copy {
+		padding: 0.5rem 1rem;
+		background: #16a34a;
+		border: none;
+		border-radius: 4px;
+		color: white;
+		font-weight: 600;
+		font-size: 0.85rem;
+		cursor: pointer;
+		min-width: 80px;
+	}
+
+	.apikey-copy:hover {
+		background: #15803d;
+	}
+
+	.apikey-dismiss {
+		padding: 0 0.6rem;
+		background: transparent;
+		border: 1px solid #4ade80;
+		border-radius: 4px;
+		color: #bbf7d0;
+		font-size: 1.2rem;
+		line-height: 1;
+		cursor: pointer;
+	}
+
+	.apikey-dismiss:hover {
+		background: #1f3a1f;
+	}
+
+	.apikey-table {
+		width: 100%;
+		border-collapse: collapse;
+		margin-top: 1rem;
+	}
+
+	.apikey-table th,
+	.apikey-table td {
+		padding: 0.6rem 0.8rem;
+		text-align: left;
+		border-bottom: 1px solid #1e293b;
+		font-size: 0.9rem;
+	}
+
+	.apikey-table thead th {
+		color: #94a3b8;
+		font-weight: 500;
+		font-size: 0.75rem;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.apikey-table tbody tr:last-child td {
+		border-bottom: none;
+	}
+
+	.apikey-name {
+		font-weight: 600;
+		color: #e2e8f0;
+	}
+
+	.apikey-table code {
+		background: #0f172a;
+		padding: 0.15rem 0.4rem;
+		border-radius: 3px;
+		font-size: 0.85em;
+		color: #cbd5e1;
+	}
+
+	.apikey-revoke {
+		padding: 0.3rem 0.7rem;
+		background: transparent;
+		border: 1px solid #ef4444;
+		border-radius: 4px;
+		color: #fca5a5;
+		font-size: 0.8rem;
+		cursor: pointer;
+	}
+
+	.apikey-revoke:hover {
+		background: #7f1d1d;
+		color: #fecaca;
 	}
 
 	main {

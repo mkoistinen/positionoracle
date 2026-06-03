@@ -101,3 +101,36 @@ export interface BlacklistResponse {
 export async function getBlacklist(): Promise<BlacklistResponse> {
 	return fetchJson('/api/washsale/blacklist');
 }
+
+// ---------------------------------------------------------------------------
+// API key management
+// ---------------------------------------------------------------------------
+
+export interface ApiKeyListItem {
+	id: number;
+	name: string;
+	key_prefix: string;
+	created_at: string;
+	last_used_at: string | null;
+}
+
+export interface ApiKeyCreated extends ApiKeyListItem {
+	/** The cleartext API key. Shown ONCE — store it immediately. */
+	key: string;
+}
+
+export async function listApiKeys(): Promise<{ keys: ApiKeyListItem[] }> {
+	return fetchJson('/api/keys');
+}
+
+export async function createApiKey(name: string): Promise<ApiKeyCreated> {
+	return fetchJson('/api/keys', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ name })
+	});
+}
+
+export async function deleteApiKey(id: number): Promise<void> {
+	await fetchJson(`/api/keys/${id}`, { method: 'DELETE' });
+}
