@@ -32,3 +32,7 @@ known-first-party = ["positionoracle"]
 
 [lint.per-file-ignores]
 "tests/**" = ["D", "ANN", "S101"]
+# FastAPI's idiomatic ``param: T = Depends(...)`` pattern triggers B008.
+"positionoracle/main.py" = ["B008"]
+# Pydantic models need ``datetime`` at runtime for field validation.
+"positionoracle/api_models.py" = ["TC003"]

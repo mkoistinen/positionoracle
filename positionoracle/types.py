@@ -56,6 +56,40 @@ class Position:
 
 
 @dataclass(frozen=True, slots=True)
+class ApiKey:
+    """A persisted API key for programmatic access.
+
+    The cleartext key is never stored — only the SHA-256 hash. A short
+    prefix is retained so the user can identify which key is which
+    after the cleartext is shown once at generation time.
+
+    Attributes
+    ----------
+    id : int
+        Database row ID (used in revoke URLs).
+    name : str
+        User-supplied label (e.g. ``"reporting-server"``).
+    key_prefix : str
+        First 8 characters of the cleartext key — displayed in lists
+        to help the user identify a row.
+    key_hash : str
+        SHA-256 hex digest of the full cleartext key.
+    created_at : datetime.datetime
+        UTC creation timestamp.
+    last_used_at : datetime.datetime | None
+        UTC timestamp of the most recent successful auth using this
+        key, or ``None`` if never used.
+    """
+
+    id: int
+    name: str
+    key_prefix: str
+    key_hash: str
+    created_at: datetime.datetime
+    last_used_at: datetime.datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class BlacklistEntry:
     """A wash-sale blacklist entry.
 

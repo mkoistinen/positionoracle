@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import aiosqlite
 
 from positionoracle.types import (
+    ApiKey,
     BlacklistEntry,
     ContractType,
     Position,
@@ -48,6 +49,17 @@ CREATE TABLE IF NOT EXISTS blacklist (
     symbol TEXT PRIMARY KEY,
     loss_date TEXT NOT NULL,
     expires TEXT NOT NULL
+)
+"""
+
+_CREATE_API_KEYS = """
+CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    key_prefix TEXT NOT NULL,
+    key_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
 )
 """
 
@@ -97,6 +109,7 @@ async def init_db(data_dir: Path) -> None:
         await conn.execute(_CREATE_SETTINGS)
         await conn.execute(_CREATE_BLACKLIST)
         await conn.execute(_CREATE_POSITION_ENTRY)
+        await conn.execute(_CREATE_API_KEYS)
         await conn.commit()
     logger.info("Database initialized at %s", db_path(data_dir))
 
@@ -581,3 +594,121 @@ async def lookup_blacklist(data_dir: Path, symbol: str) -> BlacklistEntry | None
         loss_date=datetime.date.fromisoformat(row["loss_date"]),
         expires=datetime.date.fromisoformat(row["expires"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# API key persistence
+# ---------------------------------------------------------------------------
+
+
+def _row_to_api_key(row: aiosqlite.Row) -> ApiKey:
+    """Convert a SQLite row to an ApiKey dataclass."""
+    last_used_raw = row["last_used_at"]
+    return ApiKey(
+        id=row["id"],
+        name=row["name"],
+        key_prefix=row["key_prefix"],
+        key_hash=row["key_hash"],
+        created_at=datetime.datetime.fromisoformat(row["created_at"]),
+        last_used_at=(
+            datetime.datetime.fromisoformat(last_used_raw) if last_used_raw else None
+        ),
+    )
+
+
+async def insert_api_key(
+    data_dir: Path,
+    *,
+    name: str,
+    key_prefix: str,
+    key_hash: str,
+) -> ApiKey:
+    """Insert a new API key row and return the persisted record.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Application data directory.
+    name : str
+        User-supplied label.
+    key_prefix : str
+        First 8 chars of the cleartext key for identification in lists.
+    key_hash : str
+        SHA-256 hex digest of the cleartext key.
+
+    Returns
+    -------
+    ApiKey
+        The inserted row, including its assigned database id.
+    """
+    now = datetime.datetime.now(tz=datetime.UTC).isoformat()
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """
+            INSERT INTO api_keys (name, key_prefix, key_hash, created_at, last_used_at)
+            VALUES (?, ?, ?, ?, NULL)
+            """,
+            (name, key_prefix, key_hash, now),
+        )
+        await conn.commit()
+        row_id = cursor.lastrowid
+        cursor = await conn.execute(
+            "SELECT * FROM api_keys WHERE id = ?", (row_id,),
+        )
+        row = await cursor.fetchone()
+    if row is None:
+        msg = "Failed to read back inserted API key row"
+        raise RuntimeError(msg)
+    return _row_to_api_key(row)
+
+
+async def list_api_keys(data_dir: Path) -> list[ApiKey]:
+    """Return all API key records ordered by creation time descending."""
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM api_keys ORDER BY created_at DESC",
+        )
+        rows = await cursor.fetchall()
+    return [_row_to_api_key(row) for row in rows]
+
+
+async def delete_api_key(data_dir: Path, key_id: int) -> bool:
+    """Delete a single API key by id.
+
+    Returns
+    -------
+    bool
+        True if a row was deleted.
+    """
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        cursor = await conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+async def lookup_api_key_by_hash(
+    data_dir: Path,
+    key_hash: str,
+) -> ApiKey | None:
+    """Find an API key by its SHA-256 hash."""
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM api_keys WHERE key_hash = ?", (key_hash,),
+        )
+        row = await cursor.fetchone()
+    return _row_to_api_key(row) if row else None
+
+
+async def touch_api_key(data_dir: Path, key_id: int) -> None:
+    """Update ``last_used_at`` on an API key row to now (UTC)."""
+    now = datetime.datetime.now(tz=datetime.UTC).isoformat()
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        await conn.execute(
+            "UPDATE api_keys SET last_used_at = ? WHERE id = ?",
+            (now, key_id),
+        )
+        await conn.commit()
+

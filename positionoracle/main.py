@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import (
     Cookie,
+    Depends,
     FastAPI,
     HTTPException,
     Query,
@@ -24,14 +25,38 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 
-from positionoracle import auth, beta, db, flex, fred, gex, massive, vrp
+from positionoracle import (
+    api_keys as api_keys_mod,
+)
+from positionoracle import (
+    auth,
+    beta,
+    db,
+    flex,
+    fred,
+    gex,
+    massive,
+    vrp,
+)
 from positionoracle.advisor import build_portfolio_summary
+from positionoracle.api_models import (
+    ApiKeyCreated,
+    ApiKeyList,
+    ApiKeyListItem,
+    CreateApiKeyRequest,
+    CreatedPositionResponse,
+    CreatePositionRequest,
+    PositionsResponse,
+    WashsaleResponse,
+)
 from positionoracle.config import Settings, get_settings
 from positionoracle.greeks import compute_greeks_from_massive
 from positionoracle.types import (
+    ApiKey,
     BlacklistEntry,
     ContractType,
     GEXProfile,
@@ -868,7 +893,55 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await http_client.aclose()
 
 
-app = FastAPI(title="PositionOracle", lifespan=lifespan)
+app = FastAPI(
+    title="PositionOracle",
+    version="1.0",
+    description=(
+        "PositionOracle internal and public REST API.\n\n"
+        "Browser-facing routes (`/api/auth/...`, `/api/positions/...`, etc.) "
+        "are authenticated via a signed session cookie set by the passkey "
+        "login flow.\n\n"
+        "Public REST routes under `/api/v1/` are authenticated via a Bearer "
+        "API key — generate one at `POST /api/keys` after logging in, then "
+        "send it as `Authorization: Bearer po_...`."
+    ),
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+# Bearer auth scheme used by /api/v1/* endpoints. auto_error=False lets
+# us surface a uniform 401 from the dependency rather than FastAPI's
+# default 403.
+_bearer = HTTPBearer(auto_error=False, scheme_name="API Key")
+
+
+async def _require_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> ApiKey:
+    """Validate the Bearer API key and return the matched record.
+
+    Updates ``last_used_at`` on success. Raises 401 on any failure
+    (missing header, unknown key, malformed token).
+    """
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = credentials.credentials.strip()
+    digest = api_keys_mod.hash_key(token)
+    record = await db.lookup_api_key_by_hash(settings.data_dir, digest)
+    if record is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    await db.touch_api_key(settings.data_dir, record.id)
+    return record
+
 
 # Serve SvelteKit static build
 _static_dir = Path(__file__).parent.parent / "frontend" / "build"
@@ -1009,6 +1082,364 @@ async def logout() -> JSONResponse:
     response = JSONResponse({"status": "ok"})
     response.delete_cookie(_COOKIE_NAME)
     return response
+
+
+# ---------------------------------------------------------------------------
+# API key management (session-authenticated)
+# ---------------------------------------------------------------------------
+
+
+def _api_key_to_list_item(k: ApiKey) -> ApiKeyListItem:
+    """Convert a stored ApiKey to its public list-item form."""
+    return ApiKeyListItem(
+        id=k.id,
+        name=k.name,
+        key_prefix=k.key_prefix,
+        created_at=k.created_at,
+        last_used_at=k.last_used_at,
+    )
+
+
+@app.post(
+    "/api/keys",
+    response_model=ApiKeyCreated,
+    summary="Generate a new API key",
+    tags=["keys"],
+)
+async def create_api_key(
+    request: Request,
+    body: CreateApiKeyRequest,
+) -> ApiKeyCreated:
+    """Generate a new API key for the authenticated user.
+
+    The cleartext ``key`` is returned **once** in the response — store
+    it somewhere safe. Subsequent listings show only the 8-character
+    ``key_prefix``.
+    """
+    _require_auth(request)
+    cleartext, digest, prefix = api_keys_mod.generate_key()
+    record = await db.insert_api_key(
+        settings.data_dir,
+        name=body.name.strip(),
+        key_prefix=prefix,
+        key_hash=digest,
+    )
+    logger.info("API key created: id=%d name=%r prefix=%s", record.id, record.name, prefix)
+    return ApiKeyCreated(
+        id=record.id,
+        name=record.name,
+        key_prefix=record.key_prefix,
+        key=cleartext,
+        created_at=record.created_at,
+    )
+
+
+@app.get(
+    "/api/keys",
+    response_model=ApiKeyList,
+    summary="List API keys",
+    tags=["keys"],
+)
+async def list_api_keys_endpoint(request: Request) -> ApiKeyList:
+    """List all API keys for the authenticated user (cleartext omitted)."""
+    _require_auth(request)
+    keys = await db.list_api_keys(settings.data_dir)
+    return ApiKeyList(keys=[_api_key_to_list_item(k) for k in keys])
+
+
+@app.delete(
+    "/api/keys/{key_id}",
+    summary="Revoke an API key",
+    tags=["keys"],
+)
+async def delete_api_key_endpoint(request: Request, key_id: int) -> JSONResponse:
+    """Revoke (delete) a single API key by id."""
+    _require_auth(request)
+    deleted = await db.delete_api_key(settings.data_dir, key_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="API key not found")
+    logger.info("API key revoked: id=%d", key_id)
+    return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# Public REST API v1 (Bearer-authenticated)
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/api/v1/positions",
+    response_model=PositionsResponse,
+    summary="Get positions with computed stats",
+    tags=["v1"],
+)
+async def v1_positions(
+    api_key: ApiKey = Depends(_require_api_key),
+) -> PositionsResponse:
+    """Return all positions with Greeks, VRP, P&L%, and portfolio rollup.
+
+    The payload is byte-identical to what the in-app WebSocket
+    broadcasts — same field names, same nesting, same units. Refer to
+    the ``PositionsResponse`` schema below for the full structure.
+    """
+    thresholds = await db.get_thresholds(settings.data_dir)
+    all_pgs = list(_position_greeks.values())
+    summaries = build_portfolio_summary(all_pgs, thresholds, _gex_profiles)
+    payload = _serialize_summaries(summaries)
+    return PositionsResponse.model_validate(payload)
+
+
+@app.get(
+    "/api/v1/washsale",
+    response_model=WashsaleResponse,
+    summary="Get the wash-sale blacklist",
+    tags=["v1"],
+)
+async def v1_washsale(
+    api_key: ApiKey = Depends(_require_api_key),
+) -> WashsaleResponse:
+    """Return symbols inside their IRS 30-day wash-sale window.
+
+    Buying any returned ``symbol`` before its ``expires`` date will
+    trigger a wash sale on a previously realized loss.
+    """
+    await _reload_blacklist()
+    today_et = datetime.datetime.now(tz=_ET).date()
+    entries = [
+        {
+            "symbol": e.symbol,
+            "loss_date": e.loss_date.isoformat(),
+            "expires": e.expires.isoformat(),
+            "days_remaining": max(0, (e.expires - today_et).days),
+        }
+        for e in _blacklist
+    ]
+    return WashsaleResponse(
+        entries=entries,
+        last_report_generated=_last_report_generated,
+    )
+
+
+def _synthesize_option_symbol(
+    underlying: str,
+    expiration: datetime.date,
+    contract_type: ContractType,
+    strike: float,
+) -> str:
+    """Build an IB-OCC-style option symbol.
+
+    IB's Flex export emits options as ``"AAPL  251219C00150000"`` —
+    underlying space-padded to 6 chars, YYMMDD, ``C``/``P``, strike
+    times 1000 zero-padded to 8 digits. Matching that exactly means a
+    later Flex sync upserts the row in place when IB books the trade.
+    """
+    underlying_padded = underlying.upper().ljust(6)
+    expiry_str = expiration.strftime("%y%m%d")
+    put_call = "C" if contract_type == ContractType.CALL else "P"
+    strike_int = round(strike * 1000)
+    return f"{underlying_padded}{expiry_str}{put_call}{strike_int:08d}"
+
+
+def _ensure_entry_time_aware(entry_time: datetime.datetime) -> datetime.datetime:
+    """Treat naive ``entry_time`` values as ET, per the API docs."""
+    if entry_time.tzinfo is None:
+        return entry_time.replace(tzinfo=_ET)
+    return entry_time
+
+
+@app.post(
+    "/api/v1/positions",
+    response_model=CreatedPositionResponse,
+    status_code=201,
+    summary="Record an intraday position",
+    tags=["v1"],
+)
+async def v1_create_position(
+    body: CreatePositionRequest,
+    api_key: ApiKey = Depends(_require_api_key),
+) -> CreatedPositionResponse:
+    """Insert a position recorded outside the IB Flex pipeline.
+
+    Synchronously fetches the entry spot (Massive 1-min bar), entry
+    risk-free rate (FRED), and back-solves entry IV via Black-Scholes
+    so VRP and P&L% are populated immediately. Also kicks the snapshot
+    loop so live Greeks / IV / spot for the new position are fetched
+    before the response returns.
+
+    **Reconciliation warning**: the next IB Flex sync upserts by
+    symbol. If IB has the trade, the manual entry is updated in
+    place. If IB hasn't booked it yet, the sync deletes the manual
+    entry as part of its cleanup step. Trigger a sync only after IB
+    has caught up.
+    """
+    global http_client, _positions
+
+    contract_type_str = body.contract_type.lower()
+    if contract_type_str == "stock":
+        if body.quantity == 0:
+            raise HTTPException(status_code=400, detail="Quantity must be non-zero")
+        contract_type = ContractType.STOCK
+        symbol = body.underlying.upper()
+        strike = 0.0
+        expiration = datetime.date.max
+        multiplier = body.multiplier or 1
+    else:
+        if body.strike is None or body.expiration is None:
+            raise HTTPException(
+                status_code=400,
+                detail="strike and expiration are required for option positions",
+            )
+        if body.expiration < datetime.date.today():
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot create a position on an expired contract",
+            )
+        if body.quantity == 0:
+            raise HTTPException(status_code=400, detail="Quantity must be non-zero")
+        contract_type = (
+            ContractType.CALL if contract_type_str == "call" else ContractType.PUT
+        )
+        strike = body.strike
+        expiration = body.expiration
+        multiplier = body.multiplier or 100
+        symbol = _synthesize_option_symbol(
+            body.underlying, expiration, contract_type, strike,
+        )
+
+    # Reject duplicate symbols outright so the caller sees a clean 409
+    # rather than a silent overwrite.
+    if any(p.symbol == symbol for p in _positions):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Position with symbol {symbol!r} already exists",
+        )
+
+    entry_time = _ensure_entry_time_aware(body.entry_time)
+    qty_sign = 1 if body.quantity > 0 else -1
+    cost_basis = -1 * qty_sign * body.entry_premium_per_share * abs(body.quantity) * multiplier
+
+    position = Position(
+        symbol=symbol,
+        underlying=body.underlying.upper(),
+        contract_type=contract_type,
+        strike=strike,
+        expiration=expiration,
+        quantity=body.quantity,
+        cost_basis=cost_basis,
+        multiplier=multiplier,
+    )
+
+    await db.upsert_positions(settings.data_dir, [*_positions, position])
+    await _reload_positions()
+
+    entry_record: PositionEntry | None = None
+    if contract_type != ContractType.STOCK:
+        if http_client is None:
+            http_client = httpx.AsyncClient(timeout=30)
+        synthetic_open = OpeningTrade(
+            symbol=symbol,
+            underlying=position.underlying,
+            trade_datetime=entry_time,
+            trade_price=body.entry_premium_per_share,
+            quantity=body.quantity,
+        )
+        try:
+            entry_record = await _compute_position_entry(
+                position, synthetic_open, client=http_client,
+            )
+        except Exception as exc:
+            logger.exception("Manual entry-data backfill failed for %s", symbol)
+            await db.delete_position(settings.data_dir, symbol)
+            await _reload_positions()
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to resolve entry data: {exc}",
+            ) from exc
+
+        if entry_record is None:
+            await db.delete_position(settings.data_dir, symbol)
+            await _reload_positions()
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Failed to resolve entry spot from Massive 1-min bars. "
+                    "Verify the entry_time falls inside US market hours and "
+                    "that Massive has data for the underlying."
+                ),
+            )
+
+        await db.upsert_position_entry(settings.data_dir, entry_record)
+        _position_entries[symbol] = entry_record
+
+    await _init_position_greeks()
+    await _ensure_market_data()
+    # Synchronously refresh snapshots so Greeks/IV/spot populate before
+    # we respond. Idempotent and fast for a single fresh ticker.
+    if settings.massive_api_key:
+        try:
+            await _refresh_options_snapshots()
+        except Exception:
+            logger.exception(
+                "Snapshot refresh after manual insert failed (position still "
+                "inserted, VRP/P&L will populate on next snapshot tick)",
+            )
+    else:
+        await _recompute_positions()
+
+    logger.info("Manual position created via API: %s qty=%d", symbol, body.quantity)
+    return CreatedPositionResponse(
+        symbol=symbol,
+        underlying=position.underlying,
+        contract_type=contract_type.value,
+        strike=strike,
+        expiration=expiration.isoformat(),
+        quantity=body.quantity,
+        multiplier=multiplier,
+        entry_time=entry_record.entry_time if entry_record else None,
+        entry_spot=entry_record.entry_spot if entry_record else None,
+        entry_premium_per_share=(
+            entry_record.entry_premium_per_share if entry_record else None
+        ),
+        entry_iv=entry_record.entry_iv if entry_record else None,
+        entry_rate=entry_record.entry_rate if entry_record else None,
+    )
+
+
+@app.delete(
+    "/api/v1/positions/{symbol}",
+    status_code=204,
+    summary="Close (delete) a position",
+    tags=["v1"],
+)
+async def v1_delete_position(
+    symbol: str,
+    api_key: ApiKey = Depends(_require_api_key),
+) -> None:
+    """Remove a position by its exact symbol.
+
+    Also deletes the cached ``position_entry`` row and evicts the
+    in-memory caches, then broadcasts the updated portfolio over the
+    WebSocket. Returns 404 if the symbol isn't present.
+    """
+    deleted = await db.delete_position(settings.data_dir, symbol)
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Position with symbol {symbol!r} not found",
+        )
+
+    # Prune the position_entry row too — orphan rows are harmless but
+    # we keep things tidy.
+    await db.delete_position_entries_not_in(
+        settings.data_dir,
+        {p.symbol for p in _positions if p.symbol != symbol},
+    )
+    _position_entries.pop(symbol, None)
+    _position_greeks.pop(symbol, None)
+
+    await _reload_positions()
+    await _recompute_positions()
+    logger.info("Position closed via API: %s", symbol)
 
 
 # ---------------------------------------------------------------------------
