@@ -205,7 +205,10 @@ export function evaluatePnlPct(pos: PositionData): GreekSignal {
 	if (isStockPos) {
 		const currentPrice = pos.underlying_price > 0 ? `$${pos.underlying_price.toFixed(2)}` : '—';
 		const direction = short ? 'short' : 'long';
-		const stockTail = ` Current price ${currentPrice}.`;
+		const rawPnl = p * Math.abs(pos.cost_basis);
+		const rawSign = rawPnl < 0 ? '-' : '+';
+		const rawFormatted = `${rawSign}$${Math.abs(rawPnl).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+		const stockTail = ` Current price ${currentPrice}, P&L ${rawFormatted}.`;
 		if (p >= 0.10) return { level: 'fantastic', reason: `P&L ${pct}% — ${direction} stock position is well in profit.${stockTail}` };
 		if (p >= 0) return { level: 'ok', reason: `P&L ${pct}% — ${direction} stock position is in profit.${stockTail}` };
 		if (p >= -0.10) return { level: 'warning', reason: `P&L ${pct}% — ${direction} stock position is down from entry.${stockTail}` };
@@ -213,7 +216,10 @@ export function evaluatePnlPct(pos: PositionData): GreekSignal {
 	}
 
 	const mid = pos.theoretical_mid != null ? `$${pos.theoretical_mid.toFixed(2)}` : '—';
-	const tail = ` Theoretical mid ${mid}.`;
+	const rawPnl = p * Math.abs(pos.cost_basis);
+	const rawSign = rawPnl < 0 ? '-' : '+';
+	const rawFormatted = `${rawSign}$${Math.abs(rawPnl).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+	const tail = ` Theoretical mid ${mid}, P&L ${rawFormatted}.`;
 
 	if (short) {
 		// For shorts, p > 0 = premium being earned. p = 1 means fully decayed.
