@@ -1964,18 +1964,10 @@
 		display: inline-flex;
 		align-items: center;
 		gap: 0.5rem;
-		padding: 0.4rem 0.85rem 0.4rem 0.55rem;
-		border-radius: 999px;
-		background: #1e293b;
-		border: 1px solid #334155;
 		color: #94a3b8;
 		font-size: 0.85rem;
-		transition: background 0.15s, border-color 0.15s, color 0.15s;
+		transition: color 0.15s;
 		user-select: none;
-	}
-
-	.filter-toggle:hover .filter-pill {
-		border-color: #475569;
 	}
 
 	.filter-check {
@@ -1992,9 +1984,11 @@
 		transition: background 0.15s, border-color 0.15s, color 0.15s;
 	}
 
+	.filter-toggle:hover .filter-check {
+		border-color: #64748b;
+	}
+
 	.filter-toggle input:checked + .filter-pill {
-		background: #1e3a5f;
-		border-color: #3b82f6;
 		color: #dbeafe;
 	}
 
@@ -2006,7 +2000,8 @@
 
 	.filter-toggle input:focus-visible + .filter-pill {
 		outline: 2px solid #60a5fa;
-		outline-offset: 2px;
+		outline-offset: 3px;
+		border-radius: 4px;
 	}
 
 	.portfolio-label {
