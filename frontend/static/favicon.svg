@@ -1,0 +1,42 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1b2a"/>
+      <stop offset="1" stop-color="#1b2a3a"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3ddc97"/>
+      <stop offset="0.55" stop-color="#46c2ff"/>
+      <stop offset="1" stop-color="#8a7dff"/>
+    </linearGradient>
+  </defs>
+
+  <!-- rounded square background -->
+  <rect x="0" y="0" width="512" height="512" rx="108" fill="url(#bg)"/>
+
+  <!-- gauge arc: a 270deg dial sweeping green->blue->violet (risk spectrum) -->
+  <path d="M 134 360 A 170 170 0 1 1 378 360"
+        fill="none" stroke="url(#ring)" stroke-width="34" stroke-linecap="round"/>
+
+  <!-- tick marks around the dial -->
+  <g stroke="#5d7187" stroke-width="10" stroke-linecap="round">
+    <line x1="256" y1="92" x2="256" y2="118"/>
+    <line x1="370" y1="138" x2="352" y2="156"/>
+    <line x1="416" y1="256" x2="390" y2="256"/>
+    <line x1="142" y1="138" x2="160" y2="156"/>
+    <line x1="96"  y1="256" x2="122" y2="256"/>
+  </g>
+
+  <!-- central candlestick (the "position") -->
+  <g>
+    <!-- upper/lower wicks -->
+    <line x1="256" y1="150" x2="256" y2="362" stroke="#e8eef5" stroke-width="14" stroke-linecap="round"/>
+    <!-- candle body -->
+    <rect x="218" y="194" width="76" height="124" rx="16" fill="#3ddc97" stroke="#0d1b2a" stroke-width="6"/>
+  </g>
+
+  <!-- alert pip: a needle/indicator swung into the violet "danger" zone, top-right -->
+  <circle cx="372" cy="150" r="40" fill="#ff5470"/>
+  <text x="372" y="166" font-family="Arial, Helvetica, sans-serif" font-size="56" font-weight="700"
+        text-anchor="middle" fill="#0d1b2a">!</text>
+</svg>

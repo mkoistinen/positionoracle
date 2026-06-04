@@ -27,6 +27,94 @@
 	let analyses = $state<Record<string, string>>({});
 	let analyzing = $state<Record<string, boolean>>({});
 	let analysisVisible = $state<Record<string, boolean>>({});
+
+	function loadFilterPref(key: string): boolean {
+		try {
+			const raw = localStorage.getItem(key);
+			return raw === null ? true : raw === 'true';
+		} catch {
+			return true;
+		}
+	}
+
+	let showStocks = $state(loadFilterPref('po_show_stocks'));
+	let showOptions = $state(loadFilterPref('po_show_options'));
+
+	$effect(() => {
+		try { localStorage.setItem('po_show_stocks', String(showStocks)); } catch {}
+	});
+	$effect(() => {
+		try { localStorage.setItem('po_show_options', String(showOptions)); } catch {}
+	});
+
+	function shouldShowPosition(contractType: string): boolean {
+		if (contractType === 'stock') return showStocks;
+		return showOptions; // call, put
+	}
+
+	const visibleUnderlyings = $derived.by<Record<string, UnderlyingSummary>>(() => {
+		const result: Record<string, UnderlyingSummary> = {};
+		const spyPrice = portfolio.spy_price;
+		for (const [ticker, summary] of Object.entries(underlyings)) {
+			const positions = summary.positions.filter(
+				p => shouldShowPosition(p.contract_type)
+			);
+			if (positions.length === 0) continue;
+
+			let nd = 0, ng = 0, nt = 0, nv = 0;
+			let underlyingPrice = 0;
+			for (const pos of positions) {
+				const m = pos.multiplier;
+				const q = pos.quantity;
+				nd += pos.greeks.delta * q * m;
+				ng += pos.greeks.gamma * q * m;
+				nt += pos.greeks.theta * q * m;
+				nv += pos.greeks.vega * q * m;
+				if (!underlyingPrice && pos.underlying_price) {
+					underlyingPrice = pos.underlying_price;
+				}
+			}
+			const bw = spyPrice > 0
+				? nd * summary.beta * (underlyingPrice / spyPrice)
+				: 0;
+
+			const visibleSymbols = new Set(positions.map(p => p.symbol));
+			const advice = summary.advice.filter(
+				a => visibleSymbols.has(a.position_symbol) || a.position_symbol === ticker
+			);
+
+			result[ticker] = {
+				...summary,
+				positions,
+				advice,
+				net_delta: nd,
+				net_gamma: ng,
+				net_theta: nt,
+				net_vega: nv,
+				beta_weighted_delta: bw,
+			};
+		}
+		return result;
+	});
+
+	const visiblePortfolio = $derived.by<PortfolioRollup>(() => {
+		let nd = 0, ng = 0, nt = 0, nv = 0, bw = 0;
+		for (const summary of Object.values(visibleUnderlyings)) {
+			nd += summary.net_delta;
+			ng += summary.net_gamma;
+			nt += summary.net_theta;
+			nv += summary.net_vega;
+			bw += summary.beta_weighted_delta;
+		}
+		return {
+			net_delta: nd,
+			net_gamma: ng,
+			net_theta: nt,
+			net_vega: nv,
+			beta_weighted_delta: bw,
+			spy_price: portfolio.spy_price,
+		};
+	});
 	let apiKeys = $state<ApiKeyListItem[]>([]);
 	let apiKeysLoading = $state(false);
 	let apiKeysError = $state('');
@@ -605,6 +693,26 @@
 			<div class="empty">
 				<p>No positions loaded. Import a Flex Query XML to get started.</p>
 			</div>
+		{:else if Object.keys(visibleUnderlyings).length === 0}
+			<div class="filter-bar">
+				<label class="filter-toggle">
+					<input type="checkbox" bind:checked={showStocks} />
+					<span class="filter-pill">
+						<span class="filter-check" aria-hidden="true">&#10003;</span>
+						Show Equities
+					</span>
+				</label>
+				<label class="filter-toggle">
+					<input type="checkbox" bind:checked={showOptions} />
+					<span class="filter-pill">
+						<span class="filter-check" aria-hidden="true">&#10003;</span>
+						Show Options
+					</span>
+				</label>
+			</div>
+			<div class="empty">
+				<p>Nothing to show. Toggle one of the filters above to see positions.</p>
+			</div>
 		{:else}
 			<div class="market-section">
 				<div class="market-header">
@@ -634,29 +742,46 @@
 				{/if}
 			</div>
 
-			{@const pt = evaluateNetTheta(portfolio.net_theta)}
-			{@const pv = evaluateNetVega(portfolio.net_vega)}
-			{@const pg_ = evaluateNetGamma(portfolio.net_gamma)}
-			{@const pbw = evaluateBetaWeightedDelta(portfolio.beta_weighted_delta)}
+			<div class="filter-bar">
+				<label class="filter-toggle">
+					<input type="checkbox" bind:checked={showStocks} />
+					<span class="filter-pill">
+						<span class="filter-check" aria-hidden="true">&#10003;</span>
+						Show Equities
+					</span>
+				</label>
+				<label class="filter-toggle">
+					<input type="checkbox" bind:checked={showOptions} />
+					<span class="filter-pill">
+						<span class="filter-check" aria-hidden="true">&#10003;</span>
+						Show Options
+					</span>
+				</label>
+			</div>
+
+			{@const pt = evaluateNetTheta(visiblePortfolio.net_theta)}
+			{@const pv = evaluateNetVega(visiblePortfolio.net_vega)}
+			{@const pg_ = evaluateNetGamma(visiblePortfolio.net_gamma)}
+			{@const pbw = evaluateBetaWeightedDelta(visiblePortfolio.beta_weighted_delta)}
 			<div class="portfolio-bar">
 				<span class="portfolio-label">Portfolio</span>
 				<div class="net-greeks">
 					<span class="greek-badge {signalClass(pbw.level)}" use:tooltip={pbw.reason}>
-						SPY &Delta; {formatGreek(portfolio.beta_weighted_delta, 2)}
+						SPY &Delta; {formatGreek(visiblePortfolio.beta_weighted_delta, 2)}
 					</span>
 					<span class="greek-badge {signalClass(pt.level)}" use:tooltip={pt.reason}>
-						&Theta; {formatGreek(portfolio.net_theta, 2)}
+						&Theta; {formatGreek(visiblePortfolio.net_theta, 2)}
 					</span>
 					<span class="greek-badge {signalClass(pv.level)}" use:tooltip={pv.reason}>
-						V {formatGreek(portfolio.net_vega, 2)}
+						V {formatGreek(visiblePortfolio.net_vega, 2)}
 					</span>
 					<span class="greek-badge {signalClass(pg_.level)}" use:tooltip={pg_.reason}>
-						&Gamma; {formatGreek(portfolio.net_gamma, 2)}
+						&Gamma; {formatGreek(visiblePortfolio.net_gamma, 2)}
 					</span>
 				</div>
 			</div>
 
-			{#each Object.entries(underlyings).sort(([a], [b]) => a.localeCompare(b)) as [ticker, summary]}
+			{#each Object.entries(visibleUnderlyings).sort(([a], [b]) => a.localeCompare(b)) as [ticker, summary]}
 				{@const nd = evaluateNetDelta(summary.net_delta)}
 				{@const nbw = evaluateBetaWeightedDelta(summary.beta_weighted_delta, summary.beta)}
 				{@const nt = evaluateNetTheta(summary.net_theta)}
@@ -1757,6 +1882,76 @@
 		background: #1e293b;
 		border-radius: 12px;
 		border: 1px solid #475569;
+	}
+
+	.filter-bar {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+		padding: 0 0.25rem;
+	}
+
+	.filter-toggle {
+		cursor: pointer;
+		position: relative;
+		display: inline-block;
+	}
+
+	.filter-toggle input {
+		position: absolute;
+		opacity: 0;
+		pointer-events: none;
+		width: 0;
+		height: 0;
+	}
+
+	.filter-pill {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding: 0.4rem 0.85rem 0.4rem 0.55rem;
+		border-radius: 999px;
+		background: #1e293b;
+		border: 1px solid #334155;
+		color: #94a3b8;
+		font-size: 0.85rem;
+		transition: background 0.15s, border-color 0.15s, color 0.15s;
+		user-select: none;
+	}
+
+	.filter-toggle:hover .filter-pill {
+		border-color: #475569;
+	}
+
+	.filter-check {
+		width: 1.1rem;
+		height: 1.1rem;
+		border-radius: 4px;
+		border: 1.5px solid #475569;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 0.75rem;
+		color: transparent;
+		background: transparent;
+		transition: background 0.15s, border-color 0.15s, color 0.15s;
+	}
+
+	.filter-toggle input:checked + .filter-pill {
+		background: #1e3a5f;
+		border-color: #3b82f6;
+		color: #dbeafe;
+	}
+
+	.filter-toggle input:checked + .filter-pill .filter-check {
+		background: #3b82f6;
+		border-color: #3b82f6;
+		color: white;
+	}
+
+	.filter-toggle input:focus-visible + .filter-pill {
+		outline: 2px solid #60a5fa;
+		outline-offset: 2px;
 	}
 
 	.portfolio-label {
