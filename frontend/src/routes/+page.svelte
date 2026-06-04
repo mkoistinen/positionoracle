@@ -47,6 +47,22 @@
 		try { localStorage.setItem('po_show_options', String(showOptions)); } catch {}
 	});
 
+	// Auto-dismiss the import message after 30s. The ring around the
+	// close button animates at the same duration so visual and JS timers
+	// stay in sync.
+	let importDismissTimer: ReturnType<typeof setTimeout> | undefined;
+	$effect(() => {
+		if (importDismissTimer) {
+			clearTimeout(importDismissTimer);
+			importDismissTimer = undefined;
+		}
+		if (importMessage) {
+			importDismissTimer = setTimeout(() => {
+				importMessage = '';
+			}, 30000);
+		}
+	});
+
 	function shouldShowPosition(contractType: string): boolean {
 		if (contractType === 'stock') return showStocks;
 		return showOptions; // call, put
@@ -651,10 +667,21 @@
 	</header>
 
 	{#if importMessage}
-		<div class="import-message">
-			{importMessage}
-			<button class="import-message-close" onclick={() => importMessage = ''}>&times;</button>
-		</div>
+		{#key importMessage}
+			<div class="import-message">
+				<span>{importMessage}</span>
+				<button
+					class="import-message-close"
+					onclick={() => importMessage = ''}
+					aria-label="Dismiss notification"
+				>
+					<svg class="countdown-ring" viewBox="0 0 28 28" aria-hidden="true">
+						<circle class="countdown-ring-progress" cx="14" cy="14" r="13" />
+					</svg>
+					<span class="import-message-close-x" aria-hidden="true">&times;</span>
+				</button>
+			</div>
+		{/key}
 	{/if}
 
 	<div class="tabs" role="tablist" aria-label="App sections">
@@ -693,26 +720,6 @@
 			<div class="empty">
 				<p>No positions loaded. Import a Flex Query XML to get started.</p>
 			</div>
-		{:else if Object.keys(visibleUnderlyings).length === 0}
-			<div class="filter-bar">
-				<label class="filter-toggle">
-					<input type="checkbox" bind:checked={showStocks} />
-					<span class="filter-pill">
-						<span class="filter-check" aria-hidden="true">&#10003;</span>
-						Show Equities
-					</span>
-				</label>
-				<label class="filter-toggle">
-					<input type="checkbox" bind:checked={showOptions} />
-					<span class="filter-pill">
-						<span class="filter-check" aria-hidden="true">&#10003;</span>
-						Show Options
-					</span>
-				</label>
-			</div>
-			<div class="empty">
-				<p>Nothing to show. Toggle one of the filters above to see positions.</p>
-			</div>
 		{:else}
 			<div class="market-section">
 				<div class="market-header">
@@ -742,29 +749,30 @@
 				{/if}
 			</div>
 
-			<div class="filter-bar">
-				<label class="filter-toggle">
-					<input type="checkbox" bind:checked={showStocks} />
-					<span class="filter-pill">
-						<span class="filter-check" aria-hidden="true">&#10003;</span>
-						Show Equities
-					</span>
-				</label>
-				<label class="filter-toggle">
-					<input type="checkbox" bind:checked={showOptions} />
-					<span class="filter-pill">
-						<span class="filter-check" aria-hidden="true">&#10003;</span>
-						Show Options
-					</span>
-				</label>
-			</div>
-
 			{@const pt = evaluateNetTheta(visiblePortfolio.net_theta)}
 			{@const pv = evaluateNetVega(visiblePortfolio.net_vega)}
 			{@const pg_ = evaluateNetGamma(visiblePortfolio.net_gamma)}
 			{@const pbw = evaluateBetaWeightedDelta(visiblePortfolio.beta_weighted_delta)}
 			<div class="portfolio-bar">
-				<span class="portfolio-label">Portfolio</span>
+				<div class="portfolio-left">
+					<span class="portfolio-label">Portfolio</span>
+					<div class="filter-bar">
+						<label class="filter-toggle">
+							<input type="checkbox" bind:checked={showStocks} />
+							<span class="filter-pill">
+								<span class="filter-check" aria-hidden="true">&#10003;</span>
+								Show Equities
+							</span>
+						</label>
+						<label class="filter-toggle">
+							<input type="checkbox" bind:checked={showOptions} />
+							<span class="filter-pill">
+								<span class="filter-check" aria-hidden="true">&#10003;</span>
+								Show Options
+							</span>
+						</label>
+					</div>
+				</div>
 				<div class="net-greeks">
 					<span class="greek-badge {signalClass(pbw.level)}" use:tooltip={pbw.reason}>
 						SPY &Delta; {formatGreek(visiblePortfolio.beta_weighted_delta, 2)}
@@ -781,6 +789,11 @@
 				</div>
 			</div>
 
+		{#if Object.keys(visibleUnderlyings).length === 0}
+			<div class="empty">
+				<p>Nothing to show. Toggle one of the filters above to see positions.</p>
+			</div>
+		{:else}
 			{#each Object.entries(visibleUnderlyings).sort(([a], [b]) => a.localeCompare(b)) as [ticker, summary]}
 				{@const nd = evaluateNetDelta(summary.net_delta)}
 				{@const nbw = evaluateBetaWeightedDelta(summary.beta_weighted_delta, summary.beta)}
@@ -878,7 +891,7 @@
 										<td>{isStock ? '—' : pos.expiration}</td>
 										<td class:negative={pos.quantity < 0}>{pos.quantity}</td>
 										<td class={signalClass(signals.pnl.level)} use:tooltip={signals.pnl.reason}>
-											{isStock || pos.pnl_pct == null ? '—' : (pos.pnl_pct * 100).toFixed(0) + '%'}
+											{pos.pnl_pct == null ? '—' : (pos.pnl_pct * 100).toFixed(0) + '%'}
 										</td>
 										<td>{isStock ? '—' : (pos.greeks.implied_volatility * 100).toFixed(1) + '%'}</td>
 										<td class={signalClass(signals.vrp.level)} use:tooltip={signals.vrp.reason}>
@@ -921,6 +934,7 @@
 					{/if}
 				</section>
 			{/each}
+		{/if}
 		{/if}
 
 		{#if lastReportGenerated}
@@ -1433,6 +1447,7 @@
 	}
 
 	.import-message-close {
+		position: relative;
 		background: #2b4a6e;
 		border: 1px solid #3b6998;
 		border-radius: 50%;
@@ -1452,6 +1467,38 @@
 	.import-message-close:hover {
 		background: #3b6998;
 		border-color: #93c5fd;
+	}
+
+	.import-message-close-x {
+		position: relative;
+		z-index: 1;
+	}
+
+	.countdown-ring {
+		position: absolute;
+		inset: -2px;
+		width: calc(100% + 4px);
+		height: calc(100% + 4px);
+		pointer-events: none;
+		/* rotate(-90deg) puts the start point at 12 o'clock; scaleX(-1)
+		   reverses drawing direction so the line grows counter-clockwise. */
+		transform: rotate(-90deg) scaleX(-1);
+		overflow: visible;
+	}
+
+	.countdown-ring-progress {
+		fill: none;
+		stroke: #93c5fd;
+		stroke-width: 1.5;
+		stroke-linecap: round;
+		/* 2π × 13 ≈ 81.68; full dash hidden, then animated to fully drawn. */
+		stroke-dasharray: 81.68;
+		stroke-dashoffset: 81.68;
+		animation: countdown-ring-fill 30s linear forwards;
+	}
+
+	@keyframes countdown-ring-fill {
+		to { stroke-dashoffset: 0; }
 	}
 
 	.tabs {
@@ -1884,11 +1931,17 @@
 		border: 1px solid #475569;
 	}
 
+	.portfolio-left {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 1rem;
+	}
+
 	.filter-bar {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0.5rem;
-		padding: 0 0.25rem;
 	}
 
 	.filter-toggle {

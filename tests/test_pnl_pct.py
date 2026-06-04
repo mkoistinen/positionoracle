@@ -170,20 +170,69 @@ class TestPnlPct:
         main._apply_derived_metrics_to_position(pg)
         assert pg.pnl_pct is None
 
-    def test_returns_none_for_stock(self, clean_caches):
+    def test_stock_theoretical_mid_is_none(self, clean_caches):
         pos = _make_position(
-            symbol="AAPL",
-            underlying="AAPL",
-            contract_type=ContractType.STOCK,
-            strike=0.0,
-            multiplier=1,
-            quantity=100,
-            cost_basis=15000.0,
+            symbol="AAPL", underlying="AAPL", contract_type=ContractType.STOCK,
+            strike=0.0, multiplier=1, quantity=100, cost_basis=15000.0,
         )
-        pg = _make_pg(pos)
+        pg = _make_pg(pos, spot=160.0)
+        main._apply_derived_metrics_to_position(pg)
+        # Theoretical mid only applies to options.
+        assert pg.theoretical_mid is None
+
+    def test_stock_long_in_profit(self, clean_caches):
+        # Bought 100 AAPL @ $150 (cost basis 15000), now at $165.
+        pos = _make_position(
+            symbol="AAPL", underlying="AAPL", contract_type=ContractType.STOCK,
+            strike=0.0, multiplier=1, quantity=100, cost_basis=15000.0,
+        )
+        pg = _make_pg(pos, spot=165.0)
+        main._apply_derived_metrics_to_position(pg)
+        # (165 - 150) / 150 = 0.10
+        assert pg.pnl_pct == pytest.approx(0.10)
+
+    def test_stock_long_at_a_loss(self, clean_caches):
+        # Bought 100 AAPL @ $150, now at $135.
+        pos = _make_position(
+            symbol="AAPL", underlying="AAPL", contract_type=ContractType.STOCK,
+            strike=0.0, multiplier=1, quantity=100, cost_basis=15000.0,
+        )
+        pg = _make_pg(pos, spot=135.0)
+        main._apply_derived_metrics_to_position(pg)
+        # (135 - 150) / 150 = -0.10
+        assert pg.pnl_pct == pytest.approx(-0.10)
+
+    def test_stock_short_in_profit(self, clean_caches):
+        # Sold short 100 AAPL @ $150 (proceeds -15000), now at $135 → covered cheaper.
+        pos = _make_position(
+            symbol="AAPL", underlying="AAPL", contract_type=ContractType.STOCK,
+            strike=0.0, multiplier=1, quantity=-100, cost_basis=-15000.0,
+        )
+        pg = _make_pg(pos, spot=135.0)
+        main._apply_derived_metrics_to_position(pg)
+        # Short: (150 - 135) / 150 = 0.10
+        assert pg.pnl_pct == pytest.approx(0.10)
+
+    def test_stock_short_at_a_loss(self, clean_caches):
+        # Sold short 100 AAPL @ $150, now at $165 → covering more expensive.
+        pos = _make_position(
+            symbol="AAPL", underlying="AAPL", contract_type=ContractType.STOCK,
+            strike=0.0, multiplier=1, quantity=-100, cost_basis=-15000.0,
+        )
+        pg = _make_pg(pos, spot=165.0)
+        main._apply_derived_metrics_to_position(pg)
+        # Short: (150 - 165) / 150 = -0.10
+        assert pg.pnl_pct == pytest.approx(-0.10)
+
+    def test_stock_pnl_none_without_underlying_price(self, clean_caches):
+        # Stock position but no live price yet.
+        pos = _make_position(
+            symbol="AAPL", underlying="AAPL", contract_type=ContractType.STOCK,
+            strike=0.0, multiplier=1, quantity=100, cost_basis=15000.0,
+        )
+        pg = _make_pg(pos, spot=0.0)
         main._apply_derived_metrics_to_position(pg)
         assert pg.pnl_pct is None
-        assert pg.theoretical_mid is None
 
     def test_short_at_entry_price_is_zero(self, clean_caches):
         # Pin theoretical mid to entry premium → pnl_pct should be 0.

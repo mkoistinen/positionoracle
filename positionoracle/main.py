@@ -242,7 +242,22 @@ def _apply_derived_metrics_to_position(pg: PositionGreeks) -> None:
         pg.rv = None
         pg.rv_window_days = 0
         pg.theoretical_mid = None
-        pg.pnl_pct = None
+        # Direction-aware P&L for stocks. Entry price comes from the
+        # IB-reported cost basis; long gains when price rises, short
+        # gains when price falls.
+        if (
+            pos.quantity != 0
+            and pos.cost_basis
+            and pos.multiplier > 0
+            and pg.underlying_price > 0
+        ):
+            entry_price = abs(pos.cost_basis) / (abs(pos.quantity) * pos.multiplier)
+            if pos.quantity < 0:
+                pg.pnl_pct = (entry_price - pg.underlying_price) / entry_price
+            else:
+                pg.pnl_pct = (pg.underlying_price - entry_price) / entry_price
+        else:
+            pg.pnl_pct = None
         return
 
     entry = _position_entries.get(pos.symbol)

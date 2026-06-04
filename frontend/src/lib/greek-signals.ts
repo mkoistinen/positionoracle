@@ -192,11 +192,26 @@ export function evaluateVomma(pos: PositionData): GreekSignal {
  */
 export function evaluatePnlPct(pos: PositionData): GreekSignal {
 	const p = pos.pnl_pct;
+	const isStockPos = pos.contract_type === 'stock';
 	if (p == null || !isFinite(p)) {
+		if (isStockPos) {
+			return { level: 'ok', reason: 'P&L% — waiting on the current underlying price.' };
+		}
 		return { level: 'ok', reason: 'P&L% — entry premium not yet resolved.' };
 	}
 	const short = isShort(pos);
 	const pct = (p * 100).toFixed(0);
+
+	if (isStockPos) {
+		const currentPrice = pos.underlying_price > 0 ? `$${pos.underlying_price.toFixed(2)}` : '—';
+		const direction = short ? 'short' : 'long';
+		const stockTail = ` Current price ${currentPrice}.`;
+		if (p >= 0.10) return { level: 'fantastic', reason: `P&L ${pct}% — ${direction} stock position is well in profit.${stockTail}` };
+		if (p >= 0) return { level: 'ok', reason: `P&L ${pct}% — ${direction} stock position is in profit.${stockTail}` };
+		if (p >= -0.10) return { level: 'warning', reason: `P&L ${pct}% — ${direction} stock position is down from entry.${stockTail}` };
+		return { level: 'danger', reason: `P&L ${pct}% — ${direction} stock position is significantly underwater.${stockTail}` };
+	}
+
 	const mid = pos.theoretical_mid != null ? `$${pos.theoretical_mid.toFixed(2)}` : '—';
 	const tail = ` Theoretical mid ${mid}.`;
 
@@ -264,7 +279,7 @@ export function evaluateAll(pos: PositionData): Record<string, GreekSignal> {
 			charm: STOCK_NEUTRAL,
 			vomma: STOCK_NEUTRAL,
 			vrp: STOCK_NEUTRAL,
-			pnl: STOCK_NEUTRAL,
+			pnl: evaluatePnlPct(pos),
 		};
 	}
 
