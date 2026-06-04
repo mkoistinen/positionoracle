@@ -1480,9 +1480,11 @@
 		width: calc(100% + 4px);
 		height: calc(100% + 4px);
 		pointer-events: none;
-		/* rotate(-90deg) puts the start point at 12 o'clock; scaleX(-1)
-		   reverses drawing direction so the line grows counter-clockwise. */
-		transform: rotate(-90deg) scaleX(-1);
+		/* CSS transforms apply right-to-left: scaleX(-1) first reverses
+		   the drawing direction, then rotate(90deg) puts the start point
+		   at 12 o'clock. Net result: line grows counter-clockwise from
+		   the top. */
+		transform: rotate(90deg) scaleX(-1);
 		overflow: visible;
 	}
 
