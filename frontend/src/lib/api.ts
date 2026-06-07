@@ -134,3 +134,58 @@ export async function createApiKey(name: string): Promise<ApiKeyCreated> {
 export async function deleteApiKey(id: number): Promise<void> {
 	await fetchJson(`/api/keys/${id}`, { method: 'DELETE' });
 }
+
+// ---------------------------------------------------------------------------
+// OAuth client management (session-authenticated)
+// ---------------------------------------------------------------------------
+
+/** One entry from `GET /api/oauth/clients`. No secrets are returned. */
+export interface OAuthClientItem {
+	client_id: string;
+	name: string;
+	is_public: boolean;
+	client_secret_prefix: string | null;
+	redirect_uris: string[];
+	scope: string;
+	created_at: string;
+	last_used_at: string | null;
+}
+
+/** Response from `POST /api/oauth/clients`. The cleartext secret is shown ONCE. */
+export interface OAuthClientCreated {
+	client_id: string;
+	client_secret: string;
+	client_secret_prefix: string;
+	name: string;
+	is_public: boolean;
+	created_at: string;
+}
+
+export async function listOAuthClients(): Promise<{ clients: OAuthClientItem[] }> {
+	return fetchJson('/api/oauth/clients');
+}
+
+export async function createOAuthClient(name: string): Promise<OAuthClientCreated> {
+	return fetchJson('/api/oauth/clients', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ name })
+	});
+}
+
+export async function deleteOAuthClient(clientId: string): Promise<void> {
+	await fetchJson(`/api/oauth/clients/${encodeURIComponent(clientId)}`, {
+		method: 'DELETE'
+	});
+}
+
+export async function updateOAuthClientRedirectUris(
+	clientId: string,
+	redirectUris: string[]
+): Promise<{ redirect_uris: string[] }> {
+	return fetchJson(`/api/oauth/clients/${encodeURIComponent(clientId)}`, {
+		method: 'PATCH',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ redirect_uris: redirectUris })
+	});
+}

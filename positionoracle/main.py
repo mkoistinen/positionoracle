@@ -7,6 +7,7 @@ import dataclasses
 import datetime
 import json
 import logging
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,6 +18,7 @@ from fastapi import (
     Cookie,
     Depends,
     FastAPI,
+    Form,
     HTTPException,
     Query,
     Request,
@@ -24,7 +26,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
@@ -40,6 +42,8 @@ from positionoracle import (
     fred,
     gex,
     massive,
+    mcp_server,
+    oauth,
     vrp,
 )
 from positionoracle.advisor import build_portfolio_summary
@@ -893,7 +897,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     await _load_gex_cache()
 
-    yield
+    mcp_server.set_data_dir(settings.data_dir)
+    mcp_server.set_issuer(settings.expected_origin)
+
+    # Run the MCP Streamable-HTTP session manager alongside the API so
+    # its background tasks get torn down cleanly on shutdown.
+    async with mcp_server.mcp.session_manager.run():
+        yield
 
     # Shutdown
     if stock_ws:
@@ -931,31 +941,53 @@ app = FastAPI(
 _bearer = HTTPBearer(auto_error=False, scheme_name="API Key")
 
 
+def _bearer_www_authenticate() -> dict[str, str]:
+    """``WWW-Authenticate`` value advertising OAuth resource metadata."""
+    return {
+        "WWW-Authenticate": (
+            f'Bearer realm="positionoracle", '
+            f'resource_metadata="{_issuer()}/.well-known/oauth-protected-resource"'
+        ),
+    }
+
+
 async def _require_api_key(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-) -> ApiKey:
-    """Validate the Bearer API key and return the matched record.
+) -> None:
+    """Validate the Bearer token (OAuth access token *or* legacy static key).
 
-    Updates ``last_used_at`` on success. Raises 401 on any failure
-    (missing header, unknown key, malformed token).
+    Either path updates ``last_used_at`` on success. Raises 401 on any
+    failure. Routes only use this as a side-effect auth gate — the
+    returned ``None`` is intentional.
     """
     if credentials is None or not credentials.credentials:
         raise HTTPException(
             status_code=401,
-            detail="Missing API key",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail="Missing token",
+            headers=_bearer_www_authenticate(),
         )
     token = credentials.credentials.strip()
+
+    # Try OAuth access token first (this is what Claude / OAuth-issued
+    # SDK clients send).
+    grant = await db.lookup_access_token(
+        settings.data_dir, oauth.hash_token(token),
+    )
+    if grant is not None:
+        await db.touch_oauth_client(settings.data_dir, grant.client_id)
+        return None
+
+    # Fall back to the legacy ``po_*`` static-key path.
     digest = api_keys_mod.hash_key(token)
     record = await db.lookup_api_key_by_hash(settings.data_dir, digest)
     if record is None:
         raise HTTPException(
             status_code=401,
-            detail="Invalid API key",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail="Invalid token",
+            headers=_bearer_www_authenticate(),
         )
     await db.touch_api_key(settings.data_dir, record.id)
-    return record
+    return None
 
 
 # Serve SvelteKit static build
@@ -1189,7 +1221,7 @@ async def delete_api_key_endpoint(request: Request, key_id: int) -> JSONResponse
     tags=["v1"],
 )
 async def v1_positions(
-    api_key: ApiKey = Depends(_require_api_key),
+    _: None = Depends(_require_api_key),
 ) -> PositionsResponse:
     """Return all positions with Greeks, VRP, P&L%, and portfolio rollup.
 
@@ -1211,7 +1243,7 @@ async def v1_positions(
     tags=["v1"],
 )
 async def v1_washsale(
-    api_key: ApiKey = Depends(_require_api_key),
+    _: None = Depends(_require_api_key),
 ) -> WashsaleResponse:
     """Return symbols inside their IRS 30-day wash-sale window.
 
@@ -1271,7 +1303,7 @@ def _ensure_entry_time_aware(entry_time: datetime.datetime) -> datetime.datetime
 )
 async def v1_create_position(
     body: CreatePositionRequest,
-    api_key: ApiKey = Depends(_require_api_key),
+    _: None = Depends(_require_api_key),
 ) -> CreatedPositionResponse:
     """Insert a position recorded outside the IB Flex pipeline.
 
@@ -1428,7 +1460,7 @@ async def v1_create_position(
 )
 async def v1_delete_position(
     symbol: str,
-    api_key: ApiKey = Depends(_require_api_key),
+    _: None = Depends(_require_api_key),
 ) -> None:
     """Remove a position by its exact symbol.
 
@@ -2182,6 +2214,492 @@ async def _stop_market_data() -> None:
         _gex_task = None
 
     logger.info("Market data connections stopped (no active clients)")
+
+
+# ---------------------------------------------------------------------------
+# OAuth 2.1 server (discovery, DCR, authorize, token)
+# ---------------------------------------------------------------------------
+#
+# Remote MCP clients (Claude Cowork, the API connector, etc.) require
+# OAuth 2.1; they refuse to send a static Bearer key. We host the full
+# authorization-code + PKCE flow here, plus a ``client_credentials``
+# grant for SDK / cron use.
+#
+# Static ``po_*`` Bearer keys still work alongside this (see the MCP
+# middleware and ``_require_api_key`` — both accept either an OAuth
+# access token or a legacy static key), so existing scripts keep working.
+
+
+def _issuer() -> str:
+    """Return the OAuth issuer (origin only, no trailing slash)."""
+    return settings.expected_origin.rstrip("/")
+
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _redirect_uri_matches(presented: str, registered_uris: list[str]) -> bool:
+    """Exact match by default; loopback exception per RFC 8252 §7.3.
+
+    Native MCP clients (mcp-remote, Claude Code, etc.) bind ephemeral
+    ports and shouldn't have to pre-register every one. If either side
+    uses ``127.0.0.1``, ``::1``, or ``localhost``, accept the same
+    scheme+host with any port or path.
+    """
+    if presented in registered_uris:
+        return True
+    p = urllib.parse.urlparse(presented)
+    if (p.hostname or "").lower() not in _LOOPBACK_HOSTS:
+        return False
+    for registered in registered_uris:
+        r = urllib.parse.urlparse(registered)
+        if r.scheme == p.scheme and (r.hostname or "").lower() in _LOOPBACK_HOSTS:
+            return True
+    return False
+
+
+def _oauth_error(code: str, description: str) -> JSONResponse:
+    """Build the standard OAuth error response."""
+    return JSONResponse(
+        {"error": code, "error_description": description},
+        status_code=400,
+        headers={"cache-control": "no-store", "pragma": "no-cache"},
+    )
+
+
+@app.get(
+    "/.well-known/oauth-authorization-server",
+    include_in_schema=False,
+)
+async def oauth_metadata() -> JSONResponse:
+    """RFC 8414 authorization server metadata."""
+    return JSONResponse(oauth.authorization_server_metadata(_issuer()))
+
+
+@app.get(
+    "/.well-known/oauth-protected-resource",
+    include_in_schema=False,
+)
+async def oauth_resource_metadata() -> JSONResponse:
+    """RFC 9728 protected resource metadata — points MCP clients at us."""
+    return JSONResponse(oauth.protected_resource_metadata(_issuer()))
+
+
+@app.post("/oauth/register", include_in_schema=False)
+async def oauth_register(request: Request) -> JSONResponse:
+    """Dynamic Client Registration (RFC 7591).
+
+    Clients post their ``redirect_uris`` + ``client_name``; we mint a
+    public ``client_id`` (no secret — PKCE is mandatory) and return it.
+    DCR is unauthenticated by design — that's how Claude can
+    self-register. Rate-limit by IP if abuse becomes an issue.
+    """
+    body: dict[str, Any] = await request.json()
+    redirect_uris = body.get("redirect_uris") or []
+    if not isinstance(redirect_uris, list) or not redirect_uris:
+        raise HTTPException(status_code=400, detail="redirect_uris is required")
+    for uri in redirect_uris:
+        if not isinstance(uri, str) or not uri.startswith(
+            ("https://", "http://localhost", "http://127.0.0.1"),
+        ):
+            raise HTTPException(status_code=400, detail=f"invalid redirect_uri: {uri!r}")
+
+    client_name = (body.get("client_name") or "Unnamed client").strip()[:128]
+    client_id = oauth.generate_client_id()
+    record = await db.insert_oauth_client(
+        settings.data_dir,
+        client_id=client_id,
+        client_name=client_name,
+        is_public=True,
+        client_secret_hash=None,
+        client_secret_prefix=None,
+        redirect_uris=list(redirect_uris),
+        scope=oauth.DEFAULT_SCOPE,
+    )
+    logger.info(
+        "DCR: registered public client_id=%s name=%r redirect_uris=%s",
+        client_id, client_name, redirect_uris,
+    )
+    return JSONResponse(
+        {
+            "client_id": record.client_id,
+            "client_id_issued_at": int(record.created_at.timestamp()),
+            "client_name": record.client_name,
+            "redirect_uris": record.redirect_uris,
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+            "scope": record.scope,
+        },
+        status_code=201,
+    )
+
+
+@app.get("/oauth/authorize", include_in_schema=False)
+async def oauth_authorize(
+    request: Request,
+    response_type: str = Query(...),
+    client_id: str = Query(...),
+    redirect_uri: str = Query(...),
+    state: str | None = Query(None),
+    scope: str | None = Query(None),
+    code_challenge: str = Query(...),
+    code_challenge_method: str = Query(...),
+) -> RedirectResponse:
+    """Authorization endpoint.
+
+    Validates client + redirect_uri + PKCE, ensures the user is signed
+    in (bouncing through the SPA login otherwise), and mints a one-shot
+    code the client exchanges at ``/oauth/token``. Single-user app →
+    no consent screen; the passkey login is the consent.
+    """
+    if response_type != "code":
+        raise HTTPException(status_code=400, detail="response_type must be 'code'")
+    if code_challenge_method != "S256":
+        raise HTTPException(status_code=400, detail="only S256 PKCE is supported")
+
+    client = await db.get_oauth_client(settings.data_dir, client_id)
+    if client is None:
+        raise HTTPException(status_code=400, detail="unknown client_id")
+    if not _redirect_uri_matches(redirect_uri, client.redirect_uris):
+        logger.warning(
+            "oauth: redirect_uri mismatch for client_id=%s — presented=%r registered=%r",
+            client_id, redirect_uri, client.redirect_uris,
+        )
+        raise HTTPException(
+            status_code=400, detail="redirect_uri not registered for this client",
+        )
+
+    # Require an authenticated browser session. Unauthenticated hits get
+    # bounced through the SPA login with the full authorize URL stashed
+    # in ``oauth_return`` so the SPA can replay it after passkey login.
+    cookie = request.cookies.get(_COOKIE_NAME)
+    if not _verify_session(cookie):
+        return_to = str(request.url)
+        login_url = f"/login?oauth_return={urllib.parse.quote(return_to, safe='')}"
+        return RedirectResponse(url=login_url, status_code=302)
+
+    granted_scope = oauth.normalize_scope(scope)
+    code = oauth.generate_authorization_code()
+    await db.insert_auth_code(
+        settings.data_dir,
+        code=code,
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        scope=granted_scope,
+        ttl_seconds=oauth.AUTH_CODE_TTL,
+    )
+    logger.info("oauth: issued code for client_id=%s scope=%s", client_id, granted_scope)
+
+    sep = "&" if "?" in redirect_uri else "?"
+    params = f"code={urllib.parse.quote(code, safe='')}"
+    if state is not None:
+        params += f"&state={urllib.parse.quote(state, safe='')}"
+    return RedirectResponse(url=f"{redirect_uri}{sep}{params}", status_code=302)
+
+
+def _extract_client_credentials(
+    request: Request,
+    *,
+    form_client_id: str | None,
+    form_client_secret: str | None,
+) -> tuple[str | None, str | None]:
+    """Pull client_id + client_secret from form body or Basic auth header."""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("basic "):
+        import base64
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+            cid, _, secret = decoded.partition(":")
+            return (
+                urllib.parse.unquote(cid) or None,
+                urllib.parse.unquote(secret) or None,
+            )
+        except Exception:
+            return None, None
+    return form_client_id, form_client_secret
+
+
+@app.post("/oauth/token", include_in_schema=False)
+async def oauth_token(
+    request: Request,
+    grant_type: str = Form(...),
+    code: str | None = Form(None),
+    redirect_uri: str | None = Form(None),
+    code_verifier: str | None = Form(None),
+    refresh_token: str | None = Form(None),
+    scope: str | None = Form(None),
+    client_id: str | None = Form(None),
+    client_secret: str | None = Form(None),
+) -> JSONResponse:
+    """Token endpoint — three grants.
+
+    - ``authorization_code`` (public, PKCE): exchange the one-shot code
+      for access + refresh tokens. Verifies the stored ``code_challenge``
+      against the presented ``code_verifier``.
+    - ``refresh_token``: rotate. The presented refresh is single-use.
+    - ``client_credentials`` (confidential): hand over the secret to
+      get an access token directly. No refresh token (SDKs can simply
+      re-authenticate).
+    """
+    eff_client_id, eff_client_secret = _extract_client_credentials(
+        request, form_client_id=client_id, form_client_secret=client_secret,
+    )
+
+    if grant_type == "authorization_code":
+        if not (code and redirect_uri and code_verifier and eff_client_id):
+            return _oauth_error("invalid_request", "missing fields")
+        client = await db.get_oauth_client(settings.data_dir, eff_client_id)
+        if client is None:
+            return _oauth_error("invalid_client", "unknown client_id")
+        row = await db.consume_auth_code(settings.data_dir, code)
+        if row is None:
+            return _oauth_error("invalid_grant", "code unknown or expired")
+        if row["client_id"] != eff_client_id:
+            return _oauth_error("invalid_grant", "code/client mismatch")
+        if row["redirect_uri"] != redirect_uri:
+            return _oauth_error("invalid_grant", "redirect_uri mismatch")
+        if not oauth.verify_pkce_s256(code_verifier, row["code_challenge"]):
+            return _oauth_error("invalid_grant", "PKCE verification failed")
+
+        access_cleartext, access_hash = oauth.generate_access_token()
+        refresh_cleartext, refresh_hash = oauth.generate_refresh_token()
+        await db.insert_access_token(
+            settings.data_dir,
+            access_token_hash=access_hash,
+            refresh_token_hash=refresh_hash,
+            client_id=client.client_id,
+            scope=row["scope"],
+            access_ttl_seconds=oauth.ACCESS_TOKEN_TTL,
+            refresh_ttl_seconds=oauth.REFRESH_TOKEN_TTL,
+        )
+        await db.touch_oauth_client(settings.data_dir, client.client_id)
+        return JSONResponse({
+            "access_token": access_cleartext,
+            "token_type": "Bearer",
+            "expires_in": oauth.ACCESS_TOKEN_TTL,
+            "refresh_token": refresh_cleartext,
+            "scope": row["scope"],
+        })
+
+    if grant_type == "refresh_token":
+        if not refresh_token:
+            return _oauth_error("invalid_request", "refresh_token required")
+        prev = await db.consume_refresh_token(
+            settings.data_dir, oauth.hash_token(refresh_token),
+        )
+        if prev is None:
+            return _oauth_error("invalid_grant", "refresh_token unknown or expired")
+        if eff_client_id and eff_client_id != prev["client_id"]:
+            return _oauth_error("invalid_grant", "refresh_token/client mismatch")
+
+        client = await db.get_oauth_client(settings.data_dir, prev["client_id"])
+        if client is None:
+            return _oauth_error("invalid_client", "owning client gone")
+        if not client.is_public:
+            if (
+                not eff_client_secret
+                or not client.client_secret_hash
+                or not oauth.verify_client_secret(eff_client_secret, client.client_secret_hash)
+            ):
+                return _oauth_error("invalid_client", "client authentication failed")
+
+        access_cleartext, access_hash = oauth.generate_access_token()
+        new_refresh_cleartext, new_refresh_hash = oauth.generate_refresh_token()
+        await db.insert_access_token(
+            settings.data_dir,
+            access_token_hash=access_hash,
+            refresh_token_hash=new_refresh_hash,
+            client_id=client.client_id,
+            scope=prev["scope"],
+            access_ttl_seconds=oauth.ACCESS_TOKEN_TTL,
+            refresh_ttl_seconds=oauth.REFRESH_TOKEN_TTL,
+        )
+        await db.touch_oauth_client(settings.data_dir, client.client_id)
+        return JSONResponse({
+            "access_token": access_cleartext,
+            "token_type": "Bearer",
+            "expires_in": oauth.ACCESS_TOKEN_TTL,
+            "refresh_token": new_refresh_cleartext,
+            "scope": prev["scope"],
+        })
+
+    if grant_type == "client_credentials":
+        if not (eff_client_id and eff_client_secret):
+            return _oauth_error("invalid_request", "client_id + client_secret required")
+        client = await db.get_oauth_client(settings.data_dir, eff_client_id)
+        if client is None or client.is_public or client.client_secret_hash is None:
+            return _oauth_error("invalid_client", "unknown or non-confidential client")
+        if not oauth.verify_client_secret(eff_client_secret, client.client_secret_hash):
+            return _oauth_error("invalid_client", "client authentication failed")
+
+        granted_scope = oauth.normalize_scope(scope)
+        access_cleartext, access_hash = oauth.generate_access_token()
+        await db.insert_access_token(
+            settings.data_dir,
+            access_token_hash=access_hash,
+            refresh_token_hash=None,
+            client_id=client.client_id,
+            scope=granted_scope,
+            access_ttl_seconds=oauth.ACCESS_TOKEN_TTL,
+            refresh_ttl_seconds=None,
+        )
+        await db.touch_oauth_client(settings.data_dir, client.client_id)
+        return JSONResponse({
+            "access_token": access_cleartext,
+            "token_type": "Bearer",
+            "expires_in": oauth.ACCESS_TOKEN_TTL,
+            "scope": granted_scope,
+        })
+
+    return _oauth_error("unsupported_grant_type", f"unsupported grant_type {grant_type!r}")
+
+
+# ---------------------------------------------------------------------------
+# OAuth client management (session-authenticated)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/oauth/clients", tags=["oauth"])
+async def create_oauth_client_endpoint(request: Request) -> JSONResponse:
+    """Mint a confidential OAuth client (``client_id`` + ``client_secret``).
+
+    The cleartext secret is returned **once**. Clients use it via the
+    ``client_credentials`` grant at ``/oauth/token`` to obtain a Bearer
+    access token for the MCP and ``/api/v1/*`` endpoints.
+    """
+    _require_auth(request)
+    body = await request.json()
+    client_name = (body.get("name") or "").strip()
+    if not (1 <= len(client_name) <= 128):
+        raise HTTPException(status_code=400, detail="name must be 1-128 chars")
+
+    cleartext, digest, display_prefix = oauth.generate_client_secret()
+    client_id = oauth.generate_client_id()
+    # Loopback defaults so the client also works for native auth-code
+    # callbacks (mcp-remote, hermes, etc.). The matcher's loopback
+    # exception means any port/path under these hosts is accepted.
+    default_redirect_uris = ["http://127.0.0.1", "http://localhost"]
+    record = await db.insert_oauth_client(
+        settings.data_dir,
+        client_id=client_id,
+        client_name=client_name,
+        is_public=False,
+        client_secret_hash=digest,
+        client_secret_prefix=display_prefix,
+        redirect_uris=default_redirect_uris,
+        scope=oauth.DEFAULT_SCOPE,
+    )
+    logger.info(
+        "OAuth client created: id=%d name=%r client_id=%s",
+        record.id, record.client_name, record.client_id,
+    )
+    return JSONResponse(
+        {
+            "client_id": record.client_id,
+            "client_secret": cleartext,
+            "client_secret_prefix": display_prefix,
+            "name": record.client_name,
+            "is_public": record.is_public,
+            "created_at": record.created_at.isoformat(),
+        },
+        status_code=201,
+    )
+
+
+@app.get("/api/oauth/clients", tags=["oauth"])
+async def list_oauth_clients_endpoint(request: Request) -> JSONResponse:
+    """List every OAuth client (DCR + manual). No secrets returned."""
+    _require_auth(request)
+    clients = await db.list_oauth_clients(settings.data_dir)
+    return JSONResponse({
+        "clients": [
+            {
+                "client_id": c.client_id,
+                "name": c.client_name,
+                "is_public": c.is_public,
+                "client_secret_prefix": c.client_secret_prefix,
+                "redirect_uris": c.redirect_uris,
+                "scope": c.scope,
+                "created_at": c.created_at.isoformat(),
+                "last_used_at": c.last_used_at.isoformat() if c.last_used_at else None,
+            }
+            for c in clients
+        ],
+    })
+
+
+@app.patch("/api/oauth/clients/{client_id}", tags=["oauth"])
+async def update_oauth_client_endpoint(
+    client_id: str,
+    request: Request,
+) -> JSONResponse:
+    """Edit the ``redirect_uris`` on one OAuth client.
+
+    Useful when a native client lives on a separate machine with a
+    fixed public callback URL: paste the URL hermes/etc. wants here.
+    """
+    _require_auth(request)
+    body = await request.json()
+    uris = body.get("redirect_uris")
+    if not isinstance(uris, list) or any(not isinstance(u, str) for u in uris):
+        raise HTTPException(status_code=400, detail="redirect_uris must be a list of strings")
+    for uri in uris:
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise HTTPException(status_code=400, detail=f"invalid redirect_uri: {uri!r}")
+
+    updated = await db.update_oauth_client_redirect_uris(
+        settings.data_dir,
+        client_id=client_id,
+        redirect_uris=list(uris),
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="OAuth client not found")
+    logger.info(
+        "OAuth client redirect_uris updated: client_id=%s uris=%s", client_id, uris,
+    )
+    return JSONResponse({"status": "ok", "redirect_uris": list(uris)})
+
+
+@app.delete("/api/oauth/clients/{client_id}", tags=["oauth"])
+async def delete_oauth_client_endpoint(
+    client_id: str,
+    request: Request,
+) -> JSONResponse:
+    """Revoke an OAuth client. Cascades to its codes + tokens."""
+    _require_auth(request)
+    deleted = await db.delete_oauth_client(settings.data_dir, client_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="OAuth client not found")
+    logger.info("OAuth client revoked: client_id=%s", client_id)
+    return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# MCP server (Streamable HTTP, Bearer-authenticated). Mounted *before* the
+# static SPA catch-all so /mcp doesn't fall through to the frontend.
+# ---------------------------------------------------------------------------
+
+app.mount("/mcp", mcp_server.build_asgi_app())
+
+
+@app.api_route(
+    "/mcp",
+    methods=["GET", "POST", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
+)
+async def _mcp_no_trailing_slash() -> RedirectResponse:
+    """Starlette's Mount only matches ``/mcp/``; many MCP clients send
+    requests to the slash-less form. Redirect with 307 so the method
+    and body are preserved.
+
+    OPTIONS / HEAD are included so CORS preflights and capability probes
+    redirect instead of returning 405 from the SPA catch-all.
+    """
+    return RedirectResponse(url="/mcp/", status_code=307)
 
 
 # ---------------------------------------------------------------------------

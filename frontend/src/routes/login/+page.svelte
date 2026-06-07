@@ -16,10 +16,32 @@
 	let loading = $state(true);
 	let working = $state(false);
 
+	// Read ?oauth_return=... — /oauth/authorize bounces unauthenticated
+	// users here with this set so we can replay the authorize request
+	// after passkey login (and the OAuth handshake finishes back at
+	// Claude / hermes / etc. instead of dropping the user on /).
+	function getReturnTo(): string {
+		if (typeof window === 'undefined') return '/';
+		const params = new URLSearchParams(window.location.search);
+		const target = params.get('oauth_return');
+		if (!target) return '/';
+		// Same-origin only — never bounce a freshly-authenticated user
+		// to an attacker-supplied off-host URL.
+		try {
+			const parsed = new URL(target, window.location.origin);
+			if (parsed.origin !== window.location.origin) return '/';
+			return parsed.pathname + parsed.search + parsed.hash;
+		} catch {
+			return '/';
+		}
+	}
+
+	const returnTo = getReturnTo();
+
 	$effect(() => {
 		getAuthStatus().then((status) => {
 			if (status.authenticated) {
-				goto('/');
+				goto(returnTo);
 				return;
 			}
 			hasCredentials = status.has_credentials;
@@ -47,7 +69,7 @@
 
 			const serialized = serializeCredential(credential);
 			await completeRegistration(serialized, challenge_token, keyName || 'Default Key');
-			goto('/');
+			goto(returnTo);
 		} catch (e: any) {
 			error = e.message || 'Registration failed';
 		} finally {
@@ -73,7 +95,7 @@
 
 			const serialized = serializeCredential(credential);
 			await completeLogin(serialized, challenge_token);
-			goto('/');
+			goto(returnTo);
 		} catch (e: any) {
 			error = e.message || 'Authentication failed';
 		} finally {

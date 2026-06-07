@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout, refreshGex, getBlacklist, listApiKeys, createApiKey, deleteApiKey, type BlacklistEntry, type ApiKeyListItem, type ApiKeyCreated } from '$lib/api';
+	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout, refreshGex, getBlacklist, listApiKeys, createApiKey, deleteApiKey, listOAuthClients, createOAuthClient, deleteOAuthClient, updateOAuthClientRedirectUris, type BlacklistEntry, type ApiKeyListItem, type ApiKeyCreated, type OAuthClientItem, type OAuthClientCreated } from '$lib/api';
 	import { PortfolioWebSocket, type PortfolioUpdate, type PortfolioRollup, type UnderlyingSummary, type GEXProfile } from '$lib/ws';
 	import { evaluateAll, evaluateNetDelta, evaluateNetTheta, evaluateNetVega, evaluateNetGamma, evaluateBetaWeightedDelta, signalClass } from '$lib/greek-signals';
 	import { tooltip } from '$lib/tooltip';
@@ -139,6 +139,16 @@
 	let recentlyCreatedKey = $state<ApiKeyCreated | null>(null);
 	let copyKeySuccess = $state(false);
 
+	// OAuth clients (DCR + manually-issued confidential). Lives in the
+	// same Connections tab as the legacy API keys above.
+	let oauthClients = $state<OAuthClientItem[]>([]);
+	let newOauthClientName = $state('');
+	let creatingOauthClient = $state(false);
+	let recentlyCreatedOauthClient = $state<OAuthClientCreated | null>(null);
+	let copyClientId = $state(false);
+	let copyClientSecret = $state(false);
+	let editingRedirects = $state<Record<string, string>>({});
+
 	async function handleClaude(ticker: string, event: MouseEvent) {
 		event.stopPropagation();
 
@@ -198,10 +208,14 @@
 		apiKeysLoading = true;
 		apiKeysError = '';
 		try {
-			const result = await listApiKeys();
-			apiKeys = result.keys;
+			const [keysResult, clientsResult] = await Promise.all([
+				listApiKeys(),
+				listOAuthClients(),
+			]);
+			apiKeys = keysResult.keys;
+			oauthClients = clientsResult.clients;
 		} catch (e) {
-			apiKeysError = `Failed to load API keys: ${e}`;
+			apiKeysError = `Failed to load: ${e}`;
 		} finally {
 			apiKeysLoading = false;
 		}
@@ -256,6 +270,91 @@
 	function dismissCreatedKey() {
 		recentlyCreatedKey = null;
 		copyKeySuccess = false;
+	}
+
+	// --- OAuth client management ----------------------------------------
+
+	async function handleCreateOauthClient(event: SubmitEvent) {
+		event.preventDefault();
+		const name = newOauthClientName.trim();
+		if (!name || creatingOauthClient) return;
+		creatingOauthClient = true;
+		apiKeysError = '';
+		try {
+			const created = await createOAuthClient(name);
+			recentlyCreatedOauthClient = created;
+			copyClientId = false;
+			copyClientSecret = false;
+			newOauthClientName = '';
+			await loadApiKeys();
+		} catch (e) {
+			apiKeysError = `Failed to create OAuth credentials: ${e}`;
+		} finally {
+			creatingOauthClient = false;
+		}
+	}
+
+	async function handleRevokeOauthClient(client: OAuthClientItem) {
+		const label = client.is_public ? `${client.name} (connected app)` : `${client.name} (credentials)`;
+		const ok = confirm(
+			`Revoke "${label}"?\n\n` +
+			'Any existing access tokens will stop working immediately.'
+		);
+		if (!ok) return;
+		try {
+			await deleteOAuthClient(client.client_id);
+			if (recentlyCreatedOauthClient?.client_id === client.client_id) {
+				recentlyCreatedOauthClient = null;
+			}
+			await loadApiKeys();
+		} catch (e) {
+			apiKeysError = `Failed to revoke: ${e}`;
+		}
+	}
+
+	async function copyToClipboard(text: string, which: 'id' | 'secret') {
+		try {
+			await navigator.clipboard.writeText(text);
+			if (which === 'id') {
+				copyClientId = true;
+				setTimeout(() => { copyClientId = false; }, 2000);
+			} else {
+				copyClientSecret = true;
+				setTimeout(() => { copyClientSecret = false; }, 2000);
+			}
+		} catch (e) {
+			apiKeysError = `Copy failed: ${e}`;
+		}
+	}
+
+	function dismissCreatedOauthClient() {
+		recentlyCreatedOauthClient = null;
+		copyClientId = false;
+		copyClientSecret = false;
+	}
+
+	function startEditRedirects(client: OAuthClientItem) {
+		editingRedirects[client.client_id] = client.redirect_uris.join('\n');
+	}
+
+	function cancelEditRedirects(clientId: string) {
+		delete editingRedirects[clientId];
+		editingRedirects = { ...editingRedirects };
+	}
+
+	async function saveEditRedirects(clientId: string) {
+		const lines = (editingRedirects[clientId] ?? '')
+			.split('\n')
+			.map((s) => s.trim())
+			.filter(Boolean);
+		try {
+			await updateOAuthClientRedirectUris(clientId, lines);
+			delete editingRedirects[clientId];
+			editingRedirects = { ...editingRedirects };
+			await loadApiKeys();
+		} catch (e) {
+			apiKeysError = `Failed to save redirect URIs: ${e}`;
+		}
 	}
 
 	function formatApiKeyTimestamp(iso: string | null): string {
@@ -1039,34 +1138,55 @@
 	{:else if activeTab === 'apikeys'}
 	<main class="apikeys">
 		<div class="apikeys-header">
-			<h2>API Keys</h2>
+			<h2>Connections</h2>
 			<p class="muted">
-				API keys grant programmatic, read-and-write access to your positions
-				and wash-sale data via the REST API at <code>/api/v1/</code>. Send the
-				key as a Bearer token: <code>Authorization: Bearer po_…</code>.
-				Browse <a href="/docs" target="_blank" rel="noopener">/docs</a> for the
-				full API reference.
+				Every external app or script that talks to PositionOracle does so
+				as one of three things: a <strong>Connected app</strong> (like
+				Claude, registered via OAuth), an <strong>OAuth credential</strong>
+				(<code>client_id</code> + <code>client_secret</code> you mint for
+				SDKs and cron jobs), or an <strong>API key</strong> (a single
+				static Bearer token). All three reach the same REST API at
+				<code>/api/v1/</code> and the MCP server at <code>/mcp</code>.
+				Browse <a href="/docs" target="_blank" rel="noopener">/docs</a> for endpoint details.
 			</p>
 		</div>
 
-		<form class="apikey-create" onsubmit={handleCreateApiKey}>
-			<input
-				type="text"
-				placeholder="Key name (e.g. reporting-server)"
-				bind:value={newApiKeyName}
-				maxlength="64"
-				autocomplete="off"
-				spellcheck="false"
-				disabled={creatingApiKey}
-			/>
-			<button
-				type="submit"
-				class="primary"
-				disabled={creatingApiKey || !newApiKeyName.trim()}
-			>
-				{creatingApiKey ? 'Generating…' : 'Generate new key'}
-			</button>
-		</form>
+		{#if recentlyCreatedOauthClient}
+			<div class="apikey-revealed">
+				<div class="apikey-revealed-header">
+					<strong>{recentlyCreatedOauthClient.name}</strong> created. Copy
+					the secret NOW — it cannot be retrieved again.
+				</div>
+				<div class="oauth-fresh-field">
+					<span class="oauth-fresh-label">client_id</span>
+					<code class="apikey-cleartext">{recentlyCreatedOauthClient.client_id}</code>
+					<button
+						type="button"
+						class="apikey-copy"
+						onclick={() => copyToClipboard(recentlyCreatedOauthClient!.client_id, 'id')}
+					>
+						{copyClientId ? 'Copied!' : 'Copy'}
+					</button>
+				</div>
+				<div class="oauth-fresh-field">
+					<span class="oauth-fresh-label">client_secret</span>
+					<code class="apikey-cleartext">{recentlyCreatedOauthClient.client_secret}</code>
+					<button
+						type="button"
+						class="apikey-copy"
+						onclick={() => copyToClipboard(recentlyCreatedOauthClient!.client_secret, 'secret')}
+					>
+						{copyClientSecret ? 'Copied!' : 'Copy'}
+					</button>
+					<button
+						type="button"
+						class="apikey-dismiss"
+						onclick={dismissCreatedOauthClient}
+						aria-label="Dismiss"
+					>×</button>
+				</div>
+			</div>
+		{/if}
 
 		{#if recentlyCreatedKey}
 			<div class="apikey-revealed">
@@ -1097,43 +1217,205 @@
 			<div class="ws-error">{apiKeysError}</div>
 		{/if}
 
-		{#if apiKeysLoading && apiKeys.length === 0}
+		<!-- Connected apps (DCR-registered OAuth public clients) -->
+		<h3 class="conn-section-h">Connected apps</h3>
+		{#if apiKeysLoading && oauthClients.length === 0}
 			<div class="ws-empty">Loading…</div>
-		{:else if apiKeys.length === 0}
-			<div class="ws-empty">
-				No API keys yet. Generate one above to access the REST API.
-			</div>
 		{:else}
-			<table class="apikey-table">
-				<thead>
-					<tr>
-						<th>Name</th>
-						<th>Prefix</th>
-						<th>Created</th>
-						<th>Last used</th>
-						<th></th>
-					</tr>
-				</thead>
-				<tbody>
-					{#each apiKeys as key (key.id)}
+			{@const connectedApps = oauthClients.filter((c) => c.is_public)}
+			{#if connectedApps.length === 0}
+				<div class="ws-empty small">No third-party apps connected yet.</div>
+			{:else}
+				<table class="apikey-table">
+					<thead>
 						<tr>
-							<td class="apikey-name">{key.name}</td>
-							<td><code>{key.key_prefix}…</code></td>
-							<td>{formatApiKeyTimestamp(key.created_at)}</td>
-							<td>{formatApiKeyTimestamp(key.last_used_at)}</td>
-							<td>
-								<button
-									type="button"
-									class="apikey-revoke"
-									onclick={() => handleRevokeApiKey(key)}
-								>
-									Revoke
-								</button>
-							</td>
+							<th>Name</th>
+							<th>client_id</th>
+							<th>Connected</th>
+							<th>Last used</th>
+							<th></th>
 						</tr>
-					{/each}
-				</tbody>
-			</table>
+					</thead>
+					<tbody>
+						{#each connectedApps as client (client.client_id)}
+							<tr>
+								<td class="apikey-name">{client.name}</td>
+								<td><code>{client.client_id}</code></td>
+								<td>{formatApiKeyTimestamp(client.created_at)}</td>
+								<td>{formatApiKeyTimestamp(client.last_used_at)}</td>
+								<td>
+									<button
+										type="button"
+										class="apikey-revoke"
+										onclick={() => handleRevokeOauthClient(client)}
+									>
+										Disconnect
+									</button>
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			{/if}
+		{/if}
+
+		<!-- OAuth credentials (manually-minted confidential clients) -->
+		<h3 class="conn-section-h">OAuth credentials</h3>
+		<form class="apikey-create" onsubmit={handleCreateOauthClient}>
+			<input
+				type="text"
+				placeholder="Label (e.g. reporting-server, hermes)"
+				bind:value={newOauthClientName}
+				maxlength="64"
+				autocomplete="off"
+				spellcheck="false"
+				disabled={creatingOauthClient}
+			/>
+			<button
+				type="submit"
+				class="primary"
+				disabled={creatingOauthClient || !newOauthClientName.trim()}
+			>
+				{creatingOauthClient ? 'Generating…' : 'New OAuth credentials'}
+			</button>
+		</form>
+
+		{#if !apiKeysLoading || oauthClients.length > 0}
+			{@const myCreds = oauthClients.filter((c) => !c.is_public)}
+			{#if myCreds.length === 0}
+				<div class="ws-empty small">No OAuth credentials yet.</div>
+			{:else}
+				<table class="apikey-table">
+					<thead>
+						<tr>
+							<th>Name</th>
+							<th>client_id</th>
+							<th>Secret</th>
+							<th>Created</th>
+							<th>Last used</th>
+							<th></th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each myCreds as client (client.client_id)}
+							<tr>
+								<td class="apikey-name">{client.name}</td>
+								<td><code>{client.client_id}</code></td>
+								<td><code>{client.client_secret_prefix}…</code></td>
+								<td>{formatApiKeyTimestamp(client.created_at)}</td>
+								<td>{formatApiKeyTimestamp(client.last_used_at)}</td>
+								<td>
+									<button
+										type="button"
+										class="apikey-revoke"
+										onclick={() => handleRevokeOauthClient(client)}
+									>
+										Revoke
+									</button>
+								</td>
+							</tr>
+							<tr class="redirect-row">
+								<td colspan="6">
+									{#if editingRedirects[client.client_id] !== undefined}
+										<label class="redirect-label">
+											Redirect URIs (one per line)
+											<textarea
+												rows="3"
+												bind:value={editingRedirects[client.client_id]}
+												placeholder={'http://localhost\nhttps://hermes.example.com/oauth/callback'}
+											></textarea>
+										</label>
+										<div class="redirect-actions">
+											<button
+												type="button"
+												class="redirect-btn"
+												onclick={() => cancelEditRedirects(client.client_id)}
+											>Cancel</button>
+											<button
+												type="button"
+												class="redirect-btn redirect-btn-primary"
+												onclick={() => saveEditRedirects(client.client_id)}
+											>Save</button>
+										</div>
+									{:else}
+										<span class="redirect-label">Redirects:</span>
+										{#if client.redirect_uris.length === 0}
+											<span class="muted small">none</span>
+										{:else}
+											{#each client.redirect_uris as uri}
+												<code class="redirect-uri">{uri}</code>
+											{/each}
+										{/if}
+										<button
+											type="button"
+											class="redirect-btn"
+											onclick={() => startEditRedirects(client)}
+										>Edit</button>
+									{/if}
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			{/if}
+		{/if}
+
+		<!-- Static Bearer API keys (kept alongside OAuth) -->
+		<h3 class="conn-section-h">API keys</h3>
+		<form class="apikey-create" onsubmit={handleCreateApiKey}>
+			<input
+				type="text"
+				placeholder="Key name (e.g. reporting-server)"
+				bind:value={newApiKeyName}
+				maxlength="64"
+				autocomplete="off"
+				spellcheck="false"
+				disabled={creatingApiKey}
+			/>
+			<button
+				type="submit"
+				class="primary"
+				disabled={creatingApiKey || !newApiKeyName.trim()}
+			>
+				{creatingApiKey ? 'Generating…' : 'New API key'}
+			</button>
+		</form>
+
+		{#if !apiKeysLoading || apiKeys.length > 0}
+			{#if apiKeys.length === 0}
+				<div class="ws-empty small">No API keys yet.</div>
+			{:else}
+				<table class="apikey-table">
+					<thead>
+						<tr>
+							<th>Name</th>
+							<th>Prefix</th>
+							<th>Created</th>
+							<th>Last used</th>
+							<th></th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each apiKeys as key (key.id)}
+							<tr>
+								<td class="apikey-name">{key.name}</td>
+								<td><code>{key.key_prefix}…</code></td>
+								<td>{formatApiKeyTimestamp(key.created_at)}</td>
+								<td>{formatApiKeyTimestamp(key.last_used_at)}</td>
+								<td>
+									<button
+										type="button"
+										class="apikey-revoke"
+										onclick={() => handleRevokeApiKey(key)}
+									>
+										Revoke
+									</button>
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			{/if}
 		{/if}
 	</main>
 	{/if}
@@ -1756,6 +2038,107 @@
 		display: flex;
 		gap: 0.5rem;
 		align-items: center;
+	}
+
+	.oauth-fresh-field {
+		display: flex;
+		gap: 0.5rem;
+		align-items: center;
+		margin-top: 0.5rem;
+	}
+
+	.oauth-fresh-label {
+		min-width: 100px;
+		font-size: 0.75rem;
+		color: #94a3b8;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.conn-section-h {
+		margin: 2rem 0 0.75rem;
+		font-size: 0.85rem;
+		font-weight: 600;
+		color: #cbd5e1;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		padding-bottom: 0.5rem;
+		border-bottom: 1px solid #1e293b;
+	}
+
+	.ws-empty.small {
+		padding: 0.75rem;
+		font-size: 0.85rem;
+	}
+
+	.redirect-row td {
+		background: #0f172a;
+		font-size: 0.8rem;
+		padding: 0.5rem 0.8rem;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.375rem;
+		align-items: center;
+	}
+
+	.redirect-label {
+		font-size: 0.7rem;
+		color: #94a3b8;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.redirect-row textarea {
+		width: 100%;
+		background: #1e293b;
+		color: #e2e8f0;
+		border: 1px solid #475569;
+		border-radius: 4px;
+		padding: 0.5rem;
+		font-family: ui-monospace, SFMono-Regular, monospace;
+		font-size: 0.8rem;
+		margin-top: 0.25rem;
+		resize: vertical;
+	}
+
+	.redirect-uri {
+		font-family: ui-monospace, SFMono-Regular, monospace;
+		font-size: 0.75rem;
+		background: #1e293b;
+		padding: 0.125rem 0.5rem;
+		border-radius: 4px;
+		color: #cbd5e1;
+		word-break: break-all;
+	}
+
+	.redirect-actions {
+		display: flex;
+		gap: 0.5rem;
+		justify-content: flex-end;
+		width: 100%;
+	}
+
+	.redirect-btn {
+		padding: 0.375rem 0.75rem;
+		background: #334155;
+		color: #e2e8f0;
+		border: none;
+		border-radius: 4px;
+		font-size: 0.75rem;
+		cursor: pointer;
+	}
+
+	.redirect-btn:hover {
+		background: #475569;
+	}
+
+	.redirect-btn-primary {
+		background: #3b82f6;
+		color: white;
+	}
+
+	.redirect-btn-primary:hover {
+		background: #2563eb;
 	}
 
 	.apikey-cleartext {

@@ -13,6 +13,8 @@ from positionoracle.types import (
     ApiKey,
     BlacklistEntry,
     ContractType,
+    OAuthAccessToken,
+    OAuthClient,
     Position,
     PositionEntry,
 )
@@ -76,6 +78,66 @@ CREATE TABLE IF NOT EXISTS position_entry (
 )
 """
 
+# ---------------------------------------------------------------------------
+# OAuth 2.1 tables — single-user app, so there is no ``user_id`` column;
+# the session cookie / API key uniquely identifies the (one) owner.
+# ---------------------------------------------------------------------------
+
+_CREATE_OAUTH_CLIENTS = """
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id            TEXT NOT NULL UNIQUE,
+    client_name          TEXT NOT NULL,
+    is_public            INTEGER NOT NULL,
+    client_secret_hash   TEXT,
+    client_secret_prefix TEXT,
+    redirect_uris        TEXT NOT NULL DEFAULT '[]',
+    scope                TEXT NOT NULL DEFAULT 'mcp',
+    created_at           TEXT NOT NULL,
+    last_used_at         TEXT
+)
+"""
+
+_CREATE_OAUTH_CLIENTS_INDEXES = """
+CREATE INDEX IF NOT EXISTS oauth_clients_client_id_idx ON oauth_clients (client_id)
+"""
+
+_CREATE_OAUTH_CODES = """
+CREATE TABLE IF NOT EXISTS oauth_codes (
+    code                  TEXT PRIMARY KEY,
+    client_id             TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+    redirect_uri          TEXT NOT NULL,
+    code_challenge        TEXT NOT NULL,
+    code_challenge_method TEXT NOT NULL,
+    scope                 TEXT NOT NULL,
+    expires_at            TEXT NOT NULL
+)
+"""
+
+_CREATE_OAUTH_CODES_INDEXES = """
+CREATE INDEX IF NOT EXISTS oauth_codes_expires_idx ON oauth_codes (expires_at)
+"""
+
+_CREATE_OAUTH_TOKENS = """
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    access_token_hash   TEXT NOT NULL UNIQUE,
+    refresh_token_hash  TEXT UNIQUE,
+    client_id           TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+    scope               TEXT NOT NULL,
+    access_expires_at   TEXT NOT NULL,
+    refresh_expires_at  TEXT,
+    created_at          TEXT NOT NULL
+)
+"""
+
+_CREATE_OAUTH_TOKENS_INDEXES = """
+CREATE INDEX IF NOT EXISTS oauth_tokens_access_hash_idx ON oauth_tokens (access_token_hash);
+CREATE INDEX IF NOT EXISTS oauth_tokens_refresh_hash_idx ON oauth_tokens (refresh_token_hash);
+CREATE INDEX IF NOT EXISTS oauth_tokens_client_idx ON oauth_tokens (client_id);
+CREATE INDEX IF NOT EXISTS oauth_tokens_access_expires_idx ON oauth_tokens (access_expires_at)
+"""
+
 _WASH_SALE_WINDOW_DAYS = 30
 
 
@@ -110,6 +172,14 @@ async def init_db(data_dir: Path) -> None:
         await conn.execute(_CREATE_BLACKLIST)
         await conn.execute(_CREATE_POSITION_ENTRY)
         await conn.execute(_CREATE_API_KEYS)
+        await conn.execute(_CREATE_OAUTH_CLIENTS)
+        await conn.execute(_CREATE_OAUTH_CLIENTS_INDEXES)
+        await conn.execute(_CREATE_OAUTH_CODES)
+        await conn.execute(_CREATE_OAUTH_CODES_INDEXES)
+        await conn.execute(_CREATE_OAUTH_TOKENS)
+        # The tokens DDL has 4 statements; aiosqlite.execute runs one at
+        # a time. executescript handles the full multi-statement block.
+        await conn.executescript(_CREATE_OAUTH_TOKENS_INDEXES)
         await conn.commit()
     logger.info("Database initialized at %s", db_path(data_dir))
 
@@ -711,4 +781,294 @@ async def touch_api_key(data_dir: Path, key_id: int) -> None:
             (now, key_id),
         )
         await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# OAuth 2.1 — clients, codes, tokens
+# ---------------------------------------------------------------------------
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(tz=datetime.UTC).isoformat()
+
+
+def _parse_iso_or_none(value: str | None) -> datetime.datetime | None:
+    return datetime.datetime.fromisoformat(value) if value else None
+
+
+def _row_to_oauth_client(row: aiosqlite.Row) -> OAuthClient:
+    import json
+    return OAuthClient(
+        id=row["id"],
+        client_id=row["client_id"],
+        client_name=row["client_name"],
+        is_public=bool(row["is_public"]),
+        client_secret_hash=row["client_secret_hash"],
+        client_secret_prefix=row["client_secret_prefix"],
+        redirect_uris=json.loads(row["redirect_uris"] or "[]"),
+        scope=row["scope"],
+        created_at=datetime.datetime.fromisoformat(row["created_at"]),
+        last_used_at=_parse_iso_or_none(row["last_used_at"]),
+    )
+
+
+async def insert_oauth_client(
+    data_dir: Path,
+    *,
+    client_id: str,
+    client_name: str,
+    is_public: bool,
+    client_secret_hash: str | None,
+    client_secret_prefix: str | None,
+    redirect_uris: list[str],
+    scope: str,
+) -> OAuthClient:
+    """Persist a new OAuth client and return the row."""
+    import json
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """
+            INSERT INTO oauth_clients (
+                client_id, client_name, is_public,
+                client_secret_hash, client_secret_prefix,
+                redirect_uris, scope, created_at, last_used_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                client_id, client_name, 1 if is_public else 0,
+                client_secret_hash, client_secret_prefix,
+                json.dumps(redirect_uris), scope, _utc_now_iso(),
+            ),
+        )
+        await conn.commit()
+        row_id = cursor.lastrowid
+        cursor = await conn.execute(
+            "SELECT * FROM oauth_clients WHERE id = ?", (row_id,),
+        )
+        row = await cursor.fetchone()
+    if row is None:
+        msg = "Failed to read back inserted oauth_clients row"
+        raise RuntimeError(msg)
+    return _row_to_oauth_client(row)
+
+
+async def get_oauth_client(
+    data_dir: Path,
+    client_id: str,
+) -> OAuthClient | None:
+    """Find an OAuth client by its public ``client_id``."""
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM oauth_clients WHERE client_id = ?", (client_id,),
+        )
+        row = await cursor.fetchone()
+    return _row_to_oauth_client(row) if row else None
+
+
+async def list_oauth_clients(data_dir: Path) -> list[OAuthClient]:
+    """Return every OAuth client (single-user), newest first."""
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM oauth_clients ORDER BY created_at DESC",
+        )
+        rows = await cursor.fetchall()
+    return [_row_to_oauth_client(r) for r in rows]
+
+
+async def delete_oauth_client(
+    data_dir: Path,
+    client_id: str,
+) -> bool:
+    """Revoke an OAuth client. Cascades manually to codes + tokens.
+
+    SQLite supports ``ON DELETE CASCADE`` only when ``PRAGMA foreign_keys
+    = ON`` is set; the default is OFF for backwards compatibility, so we
+    delete the dependent rows explicitly here.
+    """
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        await conn.execute("DELETE FROM oauth_tokens WHERE client_id = ?", (client_id,))
+        await conn.execute("DELETE FROM oauth_codes WHERE client_id = ?", (client_id,))
+        cursor = await conn.execute(
+            "DELETE FROM oauth_clients WHERE client_id = ?", (client_id,),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+async def touch_oauth_client(data_dir: Path, client_id: str) -> None:
+    """Stamp ``last_used_at`` on an OAuth client with the current UTC time."""
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        await conn.execute(
+            "UPDATE oauth_clients SET last_used_at = ? WHERE client_id = ?",
+            (_utc_now_iso(), client_id),
+        )
+        await conn.commit()
+
+
+async def update_oauth_client_redirect_uris(
+    data_dir: Path,
+    *,
+    client_id: str,
+    redirect_uris: list[str],
+) -> bool:
+    """Replace the ``redirect_uris`` list on one client."""
+    import json
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        cursor = await conn.execute(
+            "UPDATE oauth_clients SET redirect_uris = ? WHERE client_id = ?",
+            (json.dumps(redirect_uris), client_id),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+async def insert_auth_code(
+    data_dir: Path,
+    *,
+    code: str,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    scope: str,
+    ttl_seconds: int = 600,
+) -> None:
+    """Persist a one-shot authorization code."""
+    expires_at = (
+        datetime.datetime.now(tz=datetime.UTC)
+        + datetime.timedelta(seconds=ttl_seconds)
+    ).isoformat()
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        await conn.execute(
+            """
+            INSERT INTO oauth_codes (
+                code, client_id, redirect_uri,
+                code_challenge, code_challenge_method, scope, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                code, client_id, redirect_uri,
+                code_challenge, code_challenge_method, scope, expires_at,
+            ),
+        )
+        await conn.commit()
+
+
+async def consume_auth_code(
+    data_dir: Path,
+    code: str,
+) -> dict[str, str] | None:
+    """Atomically fetch-and-delete a (still-valid) authorization code.
+
+    Returns the row as a dict, or ``None`` if missing/expired. Single
+    use: any replay attempt returns ``None``.
+    """
+    now = _utc_now_iso()
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM oauth_codes WHERE code = ? AND expires_at > ?",
+            (code, now),
+        )
+        row = await cursor.fetchone()
+        # Always delete by code (even if expired) so the table doesn't
+        # accumulate. RETURNING isn't available on all sqlite builds, so
+        # we read-then-delete in one transaction.
+        await conn.execute("DELETE FROM oauth_codes WHERE code = ?", (code,))
+        await conn.commit()
+    if row is None:
+        return None
+    return {k: row[k] for k in row.keys()}
+
+
+async def insert_access_token(
+    data_dir: Path,
+    *,
+    access_token_hash: str,
+    refresh_token_hash: str | None,
+    client_id: str,
+    scope: str,
+    access_ttl_seconds: int,
+    refresh_ttl_seconds: int | None,
+) -> None:
+    """Persist a freshly issued access (and optional refresh) token."""
+    now = datetime.datetime.now(tz=datetime.UTC)
+    access_expires_at = (
+        now + datetime.timedelta(seconds=access_ttl_seconds)
+    ).isoformat()
+    refresh_expires_at = (
+        (now + datetime.timedelta(seconds=refresh_ttl_seconds)).isoformat()
+        if refresh_ttl_seconds is not None else None
+    )
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        await conn.execute(
+            """
+            INSERT INTO oauth_tokens (
+                access_token_hash, refresh_token_hash, client_id, scope,
+                access_expires_at, refresh_expires_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                access_token_hash, refresh_token_hash, client_id, scope,
+                access_expires_at, refresh_expires_at, now.isoformat(),
+            ),
+        )
+        await conn.commit()
+
+
+async def lookup_access_token(
+    data_dir: Path,
+    access_token_hash: str,
+) -> OAuthAccessToken | None:
+    """Return the (still-valid) access-token grant for the hash, or ``None``."""
+    now = _utc_now_iso()
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT id, client_id, scope, access_expires_at, refresh_expires_at "
+            "FROM oauth_tokens "
+            "WHERE access_token_hash = ? AND access_expires_at > ?",
+            (access_token_hash, now),
+        )
+        row = await cursor.fetchone()
+    if row is None:
+        return None
+    return OAuthAccessToken(
+        id=row["id"],
+        client_id=row["client_id"],
+        scope=row["scope"],
+        access_expires_at=datetime.datetime.fromisoformat(row["access_expires_at"]),
+        refresh_expires_at=_parse_iso_or_none(row["refresh_expires_at"]),
+    )
+
+
+async def consume_refresh_token(
+    data_dir: Path,
+    refresh_token_hash: str,
+) -> dict[str, str] | None:
+    """Atomically fetch-and-delete a refresh-token row.
+
+    Returns a dict with ``client_id`` + ``scope`` keys, or ``None`` if the
+    refresh token is unknown or expired. Single-use.
+    """
+    now = _utc_now_iso()
+    async with aiosqlite.connect(db_path(data_dir)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT client_id, scope FROM oauth_tokens "
+            "WHERE refresh_token_hash = ? AND refresh_expires_at > ?",
+            (refresh_token_hash, now),
+        )
+        row = await cursor.fetchone()
+        await conn.execute(
+            "DELETE FROM oauth_tokens WHERE refresh_token_hash = ?",
+            (refresh_token_hash,),
+        )
+        await conn.commit()
+    if row is None:
+        return None
+    return {"client_id": row["client_id"], "scope": row["scope"]}
 

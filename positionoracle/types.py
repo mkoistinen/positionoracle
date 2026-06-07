@@ -90,6 +90,80 @@ class ApiKey:
 
 
 @dataclass(frozen=True, slots=True)
+class OAuthClient:
+    """A registered OAuth 2.1 client.
+
+    Two flavours live in the same table:
+
+    - **Public** (``is_public=True``) — registered via Dynamic Client
+      Registration; no ``client_secret``. PKCE is mandatory.
+    - **Confidential** (``is_public=False``) — minted from the
+      management UI; has a ``client_secret`` (we store only the hash).
+      Uses the ``client_credentials`` grant.
+
+    Attributes
+    ----------
+    id : int
+        Database row id (used by management endpoints).
+    client_id : str
+        Public identifier sent on every OAuth request.
+    client_name : str
+        Human label (``"Claude"``, ``"hermes"``, …).
+    is_public : bool
+        True = DCR-issued public client; False = confidential with secret.
+    client_secret_hash : str | None
+        SHA-256 hex digest of the cleartext secret. ``None`` for public.
+    client_secret_prefix : str | None
+        First 8 chars of the cleartext secret for identification in lists.
+    redirect_uris : list[str]
+        Allowed redirect targets for the authorization-code grant.
+    scope : str
+        Space-separated scopes granted to this client.
+    created_at : datetime.datetime
+        UTC creation timestamp.
+    last_used_at : datetime.datetime | None
+        UTC timestamp of the most recent successful token use.
+    """
+
+    id: int
+    client_id: str
+    client_name: str
+    is_public: bool
+    client_secret_hash: str | None
+    client_secret_prefix: str | None
+    redirect_uris: list[str]
+    scope: str
+    created_at: datetime.datetime
+    last_used_at: datetime.datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthAccessToken:
+    """An issued OAuth access token (one row per active grant).
+
+    Attributes
+    ----------
+    id : int
+        Database row id.
+    client_id : str
+        The owning OAuth client.
+    scope : str
+        Granted scopes.
+    access_expires_at : datetime.datetime
+        UTC instant the access token stops being valid.
+    refresh_expires_at : datetime.datetime | None
+        UTC instant the refresh token stops being valid (``None`` for
+        grants without a refresh token, e.g. ``client_credentials``).
+    """
+
+    id: int
+    client_id: str
+    scope: str
+    access_expires_at: datetime.datetime
+    refresh_expires_at: datetime.datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class BlacklistEntry:
     """A wash-sale blacklist entry.
 
