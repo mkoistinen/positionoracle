@@ -72,12 +72,15 @@ mcp = FastMCP(
     "positionoracle",
     instructions=(
         "Tools for PositionOracle, an options-position monitor. "
-        "Use get_positions for a live snapshot of every open position "
-        "with Greeks, VRP, P&L%, and portfolio rollup; "
-        "get_washsale_blacklist for the IRS 30-day wash-sale list; "
-        "get_gex_profiles for dealer gamma exposure walls; "
-        "create_position to record an intraday trade before the IB "
-        "Flex sync sees it; and close_position to remove one by symbol."
+        "Start with list_positions for a compact roster of every open "
+        "position (cheap), then get_position(symbol) for full Greeks / "
+        "VRP / P&L on a row that matters. Use get_positions only when "
+        "you need the per-underlying rollup and net Greeks across "
+        "positions. get_washsale_blacklist returns the IRS 30-day "
+        "wash-sale list; get_gex_profiles returns dealer gamma walls "
+        "(filter by underlying — the strike grids are heavy). "
+        "create_position records an intraday trade before the IB Flex "
+        "sync sees it; close_position removes one by symbol."
     ),
     stateless_http=True,
     streamable_http_path="/",
@@ -211,12 +214,98 @@ def _parse_iso_date(s: str) -> datetime.date:
 
 
 @mcp.tool()
-async def get_positions() -> dict[str, Any]:
-    """Return every open position with Greeks, VRP, P&L%, and portfolio rollup.
+async def list_positions() -> dict[str, Any]:
+    """Return a compact list of every open position (one-liner per row).
 
-    The payload is byte-identical to ``GET /api/v1/positions`` (and to
-    the in-app WebSocket broadcast): same field names, same units, same
-    nesting. The top-level keys are:
+    Use this first to see what's open; then call ``get_position(symbol)``
+    for full Greeks / VRP / P&L on any specific row. Much cheaper than
+    ``get_positions`` — the per-position payload is ~6 fields rather
+    than the full ~20.
+
+    Each row contains: ``symbol``, ``underlying``, ``contract_type``
+    (``call`` / ``put`` / ``stock``), ``strike``, ``expiration`` (ISO
+    date), ``quantity`` (signed; negative = short), and ``pnl_pct``
+    (direction-aware fraction of entry premium; ``null`` if entry data
+    isn't loaded yet). Rows are sorted underlying → expiration → strike
+    to match how the UI lists them.
+    """
+    from positionoracle import main as app_main
+
+    rows = []
+    for pg in sorted(
+        app_main._position_greeks.values(),
+        key=lambda p: (p.position.underlying, p.position.expiration, p.position.strike),
+    ):
+        pos = pg.position
+        rows.append({
+            "symbol": pos.symbol,
+            "underlying": pos.underlying,
+            "contract_type": pos.contract_type.value,
+            "strike": pos.strike,
+            "expiration": pos.expiration.isoformat(),
+            "quantity": pos.quantity,
+            "pnl_pct": pg.pnl_pct,
+        })
+    return {"positions": rows, "count": len(rows)}
+
+
+@mcp.tool()
+async def get_position(symbol: str) -> dict[str, Any]:
+    """Return full detail for one open position.
+
+    The symbol is the IB OCC-style option string (e.g.
+    ``"AAPL  251219C00150000"``) for options, or the bare ticker for
+    stock — exactly as ``list_positions`` returns it. Raises a ValueError
+    if no open position matches.
+
+    Fields: position descriptors (``symbol``, ``underlying``,
+    ``contract_type``, ``strike``, ``expiration``, ``quantity``,
+    ``cost_basis``, ``multiplier``), live market (``underlying_price``,
+    ``option_mid``, ``theoretical_mid``), P&L (``pnl_pct``), full
+    ``greeks`` (delta/gamma/theta/vega + second-order vanna/charm/vomma
+    + ``implied_volatility``), and VRP context (``vrp``, ``entry_iv``,
+    ``rv``, ``rv_window_days``).
+    """
+    import dataclasses
+
+    from positionoracle import main as app_main
+
+    pg = app_main._position_greeks.get(symbol)
+    if pg is None:
+        raise ValueError(f"no open position with symbol {symbol!r}")
+    pos = pg.position
+    return {
+        "symbol": pos.symbol,
+        "underlying": pos.underlying,
+        "contract_type": pos.contract_type.value,
+        "strike": pos.strike,
+        "expiration": pos.expiration.isoformat(),
+        "quantity": pos.quantity,
+        "cost_basis": pos.cost_basis,
+        "multiplier": pos.multiplier,
+        "underlying_price": pg.underlying_price,
+        "option_mid": pg.option_mid,
+        "theoretical_mid": pg.theoretical_mid,
+        "pnl_pct": pg.pnl_pct,
+        "greeks": dataclasses.asdict(pg.greeks),
+        "vrp": pg.vrp,
+        "entry_iv": pg.entry_iv,
+        "rv": pg.rv,
+        "rv_window_days": pg.rv_window_days,
+    }
+
+
+@mcp.tool()
+async def get_positions(include_gex: bool = False) -> dict[str, Any]:
+    """Return every open position grouped by underlying, with rollup.
+
+    For most use cases ``list_positions`` is the cheaper starting point
+    — this tool returns every per-position field plus per-underlying
+    net Greeks, beta-weighted delta, and advice items. Prefer it when
+    you actually need the cross-position view (e.g. "show me net theta
+    on SPY").
+
+    Top-level keys:
 
     - ``last_updated`` — ISO timestamp of when this snapshot was rendered.
     - ``last_report_generated`` — ISO timestamp of the most recent IB
@@ -225,8 +314,10 @@ async def get_positions() -> dict[str, Any]:
     - ``underlyings`` — map of ticker → net Greeks, beta-weighted delta,
       per-position detail, and advice items.
     - ``portfolio`` — rollup across all underlyings.
-    - ``gex`` — per-underlying gamma exposure profiles (omitted if no
-      GEX data is cached).
+    - ``gex`` — per-underlying gamma exposure profiles. **Omitted by
+      default to keep the payload small.** Pass ``include_gex=True`` to
+      embed the full strike grid here, or call ``get_gex_profiles`` for
+      a single ticker.
     """
     from positionoracle import main as app_main
     from positionoracle.advisor import build_portfolio_summary
@@ -234,7 +325,10 @@ async def get_positions() -> dict[str, Any]:
     thresholds = await db.get_thresholds(_require_data_dir())
     all_pgs = list(app_main._position_greeks.values())
     summaries = build_portfolio_summary(all_pgs, thresholds, app_main._gex_profiles)
-    return app_main._serialize_summaries(summaries)
+    payload = app_main._serialize_summaries(summaries)
+    if not include_gex:
+        payload.pop("gex", None)
+    return payload
 
 
 @mcp.tool()
