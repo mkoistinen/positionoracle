@@ -2476,13 +2476,16 @@ async def oauth_token(
             refresh_ttl_seconds=oauth.REFRESH_TOKEN_TTL,
         )
         await db.touch_oauth_client(settings.data_dir, client.client_id)
-        return JSONResponse({
-            "access_token": access_cleartext,
-            "token_type": "Bearer",
-            "expires_in": oauth.ACCESS_TOKEN_TTL,
-            "refresh_token": refresh_cleartext,
-            "scope": row["scope"],
-        })
+        return JSONResponse(
+            {
+                "access_token": access_cleartext,
+                "token_type": "Bearer",
+                "expires_in": oauth.ACCESS_TOKEN_TTL,
+                "refresh_token": refresh_cleartext,
+                "scope": row["scope"],
+            },
+            headers={"cache-control": "no-store", "pragma": "no-cache"},
+        )
 
     if grant_type == "refresh_token":
         if not refresh_token:
@@ -2518,13 +2521,16 @@ async def oauth_token(
             refresh_ttl_seconds=oauth.REFRESH_TOKEN_TTL,
         )
         await db.touch_oauth_client(settings.data_dir, client.client_id)
-        return JSONResponse({
-            "access_token": access_cleartext,
-            "token_type": "Bearer",
-            "expires_in": oauth.ACCESS_TOKEN_TTL,
-            "refresh_token": new_refresh_cleartext,
-            "scope": prev["scope"],
-        })
+        return JSONResponse(
+            {
+                "access_token": access_cleartext,
+                "token_type": "Bearer",
+                "expires_in": oauth.ACCESS_TOKEN_TTL,
+                "refresh_token": new_refresh_cleartext,
+                "scope": prev["scope"],
+            },
+            headers={"cache-control": "no-store", "pragma": "no-cache"},
+        )
 
     if grant_type == "client_credentials":
         if not (eff_client_id and eff_client_secret):
@@ -2547,12 +2553,15 @@ async def oauth_token(
             refresh_ttl_seconds=None,
         )
         await db.touch_oauth_client(settings.data_dir, client.client_id)
-        return JSONResponse({
-            "access_token": access_cleartext,
-            "token_type": "Bearer",
-            "expires_in": oauth.ACCESS_TOKEN_TTL,
-            "scope": granted_scope,
-        })
+        return JSONResponse(
+            {
+                "access_token": access_cleartext,
+                "token_type": "Bearer",
+                "expires_in": oauth.ACCESS_TOKEN_TTL,
+                "scope": granted_scope,
+            },
+            headers={"cache-control": "no-store", "pragma": "no-cache"},
+        )
 
     return _oauth_error("unsupported_grant_type", f"unsupported grant_type {grant_type!r}")
 
