@@ -418,7 +418,11 @@ async def create_position(
     expiration: str | None = None,
     multiplier: int | None = None,
 ) -> dict[str, Any]:
-    """Record an intraday position before IB's next Flex sync sees it.
+    """Record or update an intraday position before IB's next Flex sync.
+
+    Upserts by symbol: submitting a position whose symbol already exists
+    replaces it in place, so this is also how you change a position's
+    quantity (e.g. scaling 100 shares to 200) between Flex syncs.
 
     Parameters
     ----------

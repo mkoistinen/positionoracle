@@ -234,16 +234,69 @@ class TestPnlPct:
         main._apply_derived_metrics_to_position(pg)
         assert pg.pnl_pct is None
 
-    def test_short_at_entry_price_is_zero(self, clean_caches):
-        # Pin theoretical mid to entry premium → pnl_pct should be 0.
+    def test_short_at_entry_mid_reflects_exit_friction(self, clean_caches):
+        # When the mid equals the entry premium, the friction-adjusted
+        # exit mark (mid + half-spread + commission) is above entry, so a
+        # short shows a small loss — you can't close at the mid for free.
         pos = _make_position(days_to_expiry=30)
         main._position_entries[pos.symbol] = _make_entry(
             pos, entry_premium_per_share=2.0,
         )
         pg = _make_pg(pos, spot=100.0, iv=0.25)
 
-        # Force theoretical_mid to equal entry premium.
+        # Force theoretical_mid to equal entry premium; no live quotes.
         with patch("positionoracle.vrp.bs_price", return_value=2.0):
             main._apply_derived_metrics_to_position(pg)
 
-        assert pg.pnl_pct == pytest.approx(0.0)
+        half = main.settings.option_spread_pct / 2.0
+        comm_ps = main.settings.option_commission_per_contract / 100
+        exit_val = 2.0 * (1.0 + half) + comm_ps
+        assert pg.exit_value == pytest.approx(exit_val)
+        assert pg.pnl_pct == pytest.approx((2.0 - exit_val) / 2.0)
+        assert pg.pnl_pct < 0
+
+    def test_long_marks_to_bid_when_quote_present(self, clean_caches):
+        # A long is marked to the bid (less exit commission), not the mid.
+        pos = _make_position(
+            contract_type=ContractType.CALL, strike=100.0,
+            quantity=1, cost_basis=100.0, days_to_expiry=20,
+        )
+        main._position_entries[pos.symbol] = _make_entry(
+            pos, entry_premium_per_share=1.0,
+        )
+        pg = _make_pg(pos, spot=110.0, iv=0.25)
+        pg.option_bid = 9.80
+        pg.option_ask = 10.20  # mid would be 10.00; long must use the bid
+        main._apply_derived_metrics_to_position(pg)
+
+        comm_ps = main.settings.option_commission_per_contract / 100
+        assert pg.exit_value == pytest.approx(9.80 - comm_ps)
+        assert pg.pnl_pct == pytest.approx((9.80 - comm_ps - 1.0) / 1.0)
+
+    def test_short_marks_to_ask_when_quote_present(self, clean_caches):
+        # A short is marked to the ask (plus exit commission), not the mid.
+        pos = _make_position(strike=100.0, quantity=-1, cost_basis=-200.0)
+        main._position_entries[pos.symbol] = _make_entry(
+            pos, entry_premium_per_share=2.0,
+        )
+        pg = _make_pg(pos, spot=100.0, iv=0.25)
+        pg.option_bid = 0.90
+        pg.option_ask = 1.10  # mid would be 1.00; short must use the ask
+        main._apply_derived_metrics_to_position(pg)
+
+        comm_ps = main.settings.option_commission_per_contract / 100
+        assert pg.exit_value == pytest.approx(1.10 + comm_ps)
+        assert pg.pnl_pct == pytest.approx((2.0 - (1.10 + comm_ps)) / 2.0)
+
+    def test_friction_makes_pnl_worse_than_raw_mid(self, clean_caches):
+        # Same setup marked at the raw mid vs the friction model: the
+        # friction model must never report a more favorable P&L.
+        pos = _make_position(strike=90.0, days_to_expiry=10)
+        main._position_entries[pos.symbol] = _make_entry(
+            pos, entry_premium_per_share=2.0,
+        )
+        pg = _make_pg(pos, spot=105.0, iv=0.15)
+        main._apply_derived_metrics_to_position(pg)
+
+        raw_mid_pnl = (2.0 - pg.theoretical_mid) / 2.0  # short, mid-based
+        assert pg.pnl_pct < raw_mid_pnl

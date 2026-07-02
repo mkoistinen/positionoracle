@@ -185,10 +185,11 @@ export function evaluateVomma(pos: PositionData): GreekSignal {
 /**
  * Direction-aware P&L as a fraction of entry premium.
  *
- * Uses the BS theoretical mid (computed from live IV) rather than
- * quote-based mid because Massive Options Starter doesn't return
- * bid/ask. Tooltip surfaces entry premium, current value, and what
- * fraction of the max profit has been realized for short positions.
+ * Anchored to the friction-adjusted exit mark (bid for longs / ask for
+ * shorts, else the BS mid haircut by a modeled half-spread, less exit
+ * commission) so it reflects a realizable close rather than a
+ * frictionless mid. Tooltip surfaces the raw mid, the exit mark, and
+ * the dollar P&L.
  */
 export function evaluatePnlPct(pos: PositionData): GreekSignal {
 	const p = pos.pnl_pct;
@@ -216,10 +217,12 @@ export function evaluatePnlPct(pos: PositionData): GreekSignal {
 	}
 
 	const mid = pos.theoretical_mid != null ? `$${pos.theoretical_mid.toFixed(2)}` : '—';
+	const exit = pos.exit_value != null ? `$${pos.exit_value.toFixed(2)}` : '—';
 	const rawPnl = p * Math.abs(pos.cost_basis);
 	const rawSign = rawPnl < 0 ? '-' : '+';
 	const rawFormatted = `${rawSign}$${Math.abs(rawPnl).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-	const tail = ` Theoretical mid ${mid}, P&L ${rawFormatted}.`;
+	// P&L is anchored to the friction-adjusted exit mark, not the raw mid.
+	const tail = ` Mid ${mid}, exit mark ${exit} (net of spread + commission), P&L ${rawFormatted}.`;
 
 	if (short) {
 		// For shorts, p > 0 = premium being earned. p = 1 means fully decayed.

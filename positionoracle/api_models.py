@@ -99,13 +99,19 @@ class PositionModel(BaseModel):
     )
     theoretical_mid: float | None = Field(
         None,
-        description="Black-Scholes price from live IV. Always populated when "
-        "inputs are valid; used as the canonical current value.",
+        description="Frictionless Black-Scholes mid from live IV. Shown for "
+        "reference and used as the base for the exit mark when quotes are absent.",
+    )
+    exit_value: float | None = Field(
+        None,
+        description="Estimated realizable per-share liquidation value net of exit "
+        "friction (bid for longs / ask for shorts, else mid haircut by a modeled "
+        "half-spread, less exit commission). P&L is anchored to this.",
     )
     pnl_pct: float | None = Field(
         None,
-        description="Direction-aware P&L as a fraction of entry premium. "
-        "Positive = position is up.",
+        description="Direction-aware P&L as a fraction of entry premium, anchored "
+        "to the friction-adjusted exit value. Positive = position is up.",
     )
     greeks: GreeksModel
     vrp: float | None = Field(

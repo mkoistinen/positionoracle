@@ -413,6 +413,31 @@
 		saveExpanded();
 	}
 
+	// Per-symbol collapse state for the advice group. Defaults to
+	// collapsed (absent key = collapsed) so the card shows a one-line
+	// severity summary until the user opens it. Persisted like `expanded`.
+	const ADVICE_OPEN_KEY = 'po_advice_open';
+
+	function loadAdviceOpen(): Record<string, boolean> {
+		try {
+			const raw = localStorage.getItem(ADVICE_OPEN_KEY);
+			return raw ? JSON.parse(raw) : {};
+		} catch {
+			return {};
+		}
+	}
+
+	function saveAdviceOpen() {
+		localStorage.setItem(ADVICE_OPEN_KEY, JSON.stringify(adviceOpen));
+	}
+
+	let adviceOpen = $state<Record<string, boolean>>(loadAdviceOpen());
+
+	function toggleAdvice(ticker: string) {
+		adviceOpen[ticker] = !adviceOpen[ticker];
+		saveAdviceOpen();
+	}
+
 	let ws: PortfolioWebSocket | null = null;
 
 	function handleUnauthorized() {
@@ -656,6 +681,31 @@
 			case 'warning': return 'advice-warning';
 			default: return 'advice-info';
 		}
+	}
+
+	// Severity order, highest first — drives the collapsed summary label,
+	// its colour, and the count ordering.
+	const ADVICE_ORDER = ['urgent', 'warning', 'info'] as const;
+
+	function adviceCounts(advice: { level: string }[]): Record<string, number> {
+		const counts: Record<string, number> = { urgent: 0, warning: 0, info: 0 };
+		for (const a of advice) {
+			counts[a.level in counts ? a.level : 'info']++;
+		}
+		return counts;
+	}
+
+	function highestAdviceLevel(advice: { level: string }[]): string {
+		const counts = adviceCounts(advice);
+		return ADVICE_ORDER.find((l) => counts[l] > 0) ?? 'info';
+	}
+
+	function adviceSummaryText(advice: { level: string }[]): string {
+		const counts = adviceCounts(advice);
+		const parts = ADVICE_ORDER.filter((l) => counts[l] > 0).map(
+			(l) => `${counts[l]} ${l}`,
+		);
+		return parts.join(' · ');
 	}
 
 	function formatTimestamp(iso: string): string {
@@ -950,13 +1000,26 @@
 					{/if}
 
 					{#if summary.advice.length > 0}
-						<div class="advice-list">
-							{#each summary.advice as item}
-								<div class="advice-item {adviceLevelClass(item.level)}">
-									<span class="advice-level">{item.level.toUpperCase()}</span>
-									{item.message}
+						<div class="advice-group">
+							<button
+								type="button"
+								class="advice-summary {adviceLevelClass(highestAdviceLevel(summary.advice))}"
+								aria-expanded={!!adviceOpen[ticker]}
+								onclick={() => toggleAdvice(ticker)}
+							>
+								<span class="caret" class:caret-open={adviceOpen[ticker]}>&#9654;</span>
+								<span class="advice-summary-text">{adviceSummaryText(summary.advice)}</span>
+							</button>
+							{#if adviceOpen[ticker]}
+								<div class="advice-list">
+									{#each summary.advice as item}
+										<div class="advice-item {adviceLevelClass(item.level)}">
+											<span class="advice-level">{item.level.toUpperCase()}</span>
+											{item.message}
+										</div>
+									{/each}
 								</div>
-							{/each}
+							{/if}
 						</div>
 					{/if}
 
@@ -2467,8 +2530,47 @@
 		font-family: 'SF Mono', 'Fira Code', monospace;
 	}
 
-	.advice-list {
+	.advice-group {
 		padding: 0.75rem 1.5rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	/* Collapsed one-line summary bar; reuses the severity colour classes
+	   (.advice-urgent / -warning / -info) via the highest present level.
+	   Individual borders are reset (not the `border` shorthand) so the
+	   severity class's coloured border-left survives. */
+	.advice-summary {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		width: 100%;
+		padding: 0.5rem 1rem;
+		border-top: none;
+		border-right: none;
+		border-bottom: none;
+		border-radius: 6px;
+		font: inherit;
+		font-size: 0.875rem;
+		color: inherit;
+		text-align: left;
+		cursor: pointer;
+	}
+
+	.advice-summary-text {
+		font-weight: 600;
+		text-transform: capitalize;
+		/* Keep the summary on a single line; ellipsize if it ever
+		   outgrows the bar. min-width:0 lets the flex item shrink. */
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.advice-list {
 		display: flex;
 		flex-direction: column;
 		gap: 0.5rem;

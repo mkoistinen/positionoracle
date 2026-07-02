@@ -42,6 +42,85 @@ class TestParseFlexXml:
         assert put.strike == 140.0
         assert put.quantity == -5
 
+    def test_lot_level_stock_rows_are_summed(self):
+        """A lot-level query emits one row per tax lot; they must sum.
+
+        Regression: buying another 100 shares of a symbol already held
+        arrives as two 100-share lot rows. The old parser overwrote by
+        symbol and kept only the last lot (200 collapsed to 100).
+        """
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse>
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1">
+      <OpenPositions>
+        <OpenPosition assetCategory="STK" symbol="AAPL"
+          underlyingSymbol="AAPL" position="100" costBasisMoney="14700"
+          multiplier="1" levelOfDetail="LOT"/>
+        <OpenPosition assetCategory="STK" symbol="AAPL"
+          underlyingSymbol="AAPL" position="100" costBasisMoney="15100"
+          multiplier="1" levelOfDetail="LOT"/>
+      </OpenPositions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+        positions = parse_flex_xml(xml)
+        stocks = [p for p in positions if p.contract_type == ContractType.STOCK]
+        assert len(stocks) == 1
+        assert stocks[0].quantity == 200
+        assert stocks[0].cost_basis == 29800.0
+
+    def test_summary_row_wins_over_its_lots(self):
+        """A SUMMARY row already aggregates its lots; don't double-count."""
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse>
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1">
+      <OpenPositions>
+        <OpenPosition assetCategory="STK" symbol="AAPL"
+          underlyingSymbol="AAPL" position="200" costBasisMoney="29800"
+          multiplier="1" levelOfDetail="SUMMARY"/>
+        <OpenPosition assetCategory="STK" symbol="AAPL"
+          underlyingSymbol="AAPL" position="100" costBasisMoney="14700"
+          multiplier="1" levelOfDetail="LOT"/>
+        <OpenPosition assetCategory="STK" symbol="AAPL"
+          underlyingSymbol="AAPL" position="100" costBasisMoney="15100"
+          multiplier="1" levelOfDetail="LOT"/>
+      </OpenPositions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+        positions = parse_flex_xml(xml)
+        stocks = [p for p in positions if p.contract_type == ContractType.STOCK]
+        assert len(stocks) == 1
+        assert stocks[0].quantity == 200
+        assert stocks[0].cost_basis == 29800.0
+
+    def test_lot_level_option_rows_are_summed(self):
+        """Option lots for the same OCC symbol sum, just like stock."""
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse>
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1">
+      <OpenPositions>
+        <OpenPosition assetCategory="OPT" symbol="AAPL  991219C00150000"
+          underlyingSymbol="AAPL" putCall="C" strike="150" expiry="20991219"
+          position="5" costBasisMoney="2500" multiplier="100"
+          levelOfDetail="LOT"/>
+        <OpenPosition assetCategory="OPT" symbol="AAPL  991219C00150000"
+          underlyingSymbol="AAPL" putCall="C" strike="150" expiry="20991219"
+          position="5" costBasisMoney="2600" multiplier="100"
+          levelOfDetail="LOT"/>
+      </OpenPositions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+        positions = parse_flex_xml(xml)
+        calls = [p for p in positions if p.contract_type == ContractType.CALL]
+        assert len(calls) == 1
+        assert calls[0].quantity == 10
+        assert calls[0].cost_basis == 5100.0
+
     def test_empty_xml_returns_empty(self):
         positions = parse_flex_xml("<root></root>")
         assert positions == []

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -25,6 +26,57 @@ _CLOSE_INDICATORS = {"C", "C;O"}
 # opens new contracts alongside closing some).
 _OPEN_INDICATORS = {"O", "O;C", "C;O"}
 _ZERO = Decimal(0)
+
+
+def _merge_open_position(
+    seen: dict[str, Position],
+    summary_locked: set[str],
+    level: str,
+    pos: Position,
+) -> None:
+    """Merge one parsed ``OpenPosition`` row into the accumulator.
+
+    IB Flex Queries can be configured at ``SUMMARY`` and/or ``LOT``
+    level of detail. A lot-level query emits one row per tax lot, so a
+    single holding of 200 shares bought in two 100-share lots arrives
+    as two rows for the same symbol. Those lots must be summed or the
+    position size is understated — a plain ``seen[symbol] = ...``
+    overwrite keeps only the last lot (the "200 collapses to 100" bug).
+
+    When both a ``SUMMARY`` row and its constituent ``LOT`` rows are
+    present for the same symbol, the summary already carries the
+    aggregated total and is authoritative; its lot rows are ignored so
+    the two are not double-counted. A query with no ``levelOfDetail``
+    attribute at all yields one row per symbol, which sums to itself.
+
+    Parameters
+    ----------
+    seen : dict[str, Position]
+        Accumulator keyed by symbol, mutated in place.
+    summary_locked : set[str]
+        Symbols for which an authoritative ``SUMMARY`` row was seen.
+    level : str
+        Upper-cased ``levelOfDetail`` attribute of the row.
+    pos : Position
+        The position parsed from this single row.
+    """
+    symbol = pos.symbol
+    if level == "SUMMARY":
+        seen[symbol] = pos
+        summary_locked.add(symbol)
+        return
+    if symbol in summary_locked:
+        # A SUMMARY row already accounts for this symbol's total.
+        return
+    existing = seen.get(symbol)
+    if existing is None:
+        seen[symbol] = pos
+        return
+    seen[symbol] = replace(
+        existing,
+        quantity=existing.quantity + pos.quantity,
+        cost_basis=existing.cost_basis + pos.cost_basis,
+    )
 
 
 def parse_flex_xml(xml_content: str) -> list[Position]:
@@ -48,10 +100,14 @@ def parse_flex_xml(xml_content: str) -> list[Position]:
         logger.exception("xml.etree not available")
         return []
 
-    # Use a dict keyed by symbol to deduplicate lot-level entries.
-    # iter("OpenPosition") recurses into nested elements, so lot-level
-    # Flex Queries can yield both summary and lot rows for the same symbol.
+    # Accumulate lot-level entries keyed by symbol. iter("OpenPosition")
+    # recurses into nested elements, so lot-level Flex Queries can yield
+    # both a summary row and its per-lot rows for the same symbol.
+    # ``_merge_open_position`` sums lots (so 200 shares held as two
+    # 100-share lots stays 200) while preferring an authoritative SUMMARY
+    # row when one is present.
     seen: dict[str, Position] = {}
+    summary_locked: set[str] = set()
 
     try:
         root = ET.fromstring(xml_content)
@@ -72,15 +128,20 @@ def parse_flex_xml(xml_content: str) -> list[Position]:
                     )
                     if not symbol or quantity == 0:
                         continue
-                    seen[symbol] = Position(
-                        symbol=symbol,
-                        underlying=symbol,
-                        contract_type=ContractType.STOCK,
-                        strike=0.0,
-                        expiration=datetime.date.max,
-                        quantity=quantity,
-                        cost_basis=cost_basis,
-                        multiplier=1,
+                    _merge_open_position(
+                        seen,
+                        summary_locked,
+                        pos_elem.get("levelOfDetail", "").upper(),
+                        Position(
+                            symbol=symbol,
+                            underlying=symbol,
+                            contract_type=ContractType.STOCK,
+                            strike=0.0,
+                            expiration=datetime.date.max,
+                            quantity=quantity,
+                            cost_basis=cost_basis,
+                            multiplier=1,
+                        ),
                     )
                 except (ValueError, TypeError):
                     logger.exception("Failed to parse stock position: %s", symbol)
@@ -121,15 +182,20 @@ def parse_flex_xml(xml_content: str) -> list[Position]:
                 else:
                     expiration = datetime.date.fromisoformat(expiry_str)
 
-                seen[symbol] = Position(
-                    symbol=symbol,
-                    underlying=underlying,
-                    contract_type=contract_type,
-                    strike=strike,
-                    expiration=expiration,
-                    quantity=quantity,
-                    cost_basis=cost_basis,
-                    multiplier=multiplier,
+                _merge_open_position(
+                    seen,
+                    summary_locked,
+                    pos_elem.get("levelOfDetail", "").upper(),
+                    Position(
+                        symbol=symbol,
+                        underlying=underlying,
+                        contract_type=contract_type,
+                        strike=strike,
+                        expiration=expiration,
+                        quantity=quantity,
+                        cost_basis=cost_basis,
+                        multiplier=multiplier,
+                    ),
                 )
             except (ValueError, TypeError):
                 logger.exception("Failed to parse position: %s", symbol)

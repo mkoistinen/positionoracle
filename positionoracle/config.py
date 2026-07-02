@@ -38,6 +38,13 @@ class Settings(BaseSettings):
         claude-sonnet-4-6, claude-opus-4-6).
     data_dir : Path
         Directory for persistent data (SQLite DB, credentials).
+    option_spread_pct : float
+        Assumed full bid/ask spread as a fraction of the option mid,
+        used to haircut P&L toward a realizable exit when live quotes
+        are unavailable. Default 0.05 (5%).
+    option_commission_per_contract : float
+        Per-contract commission subtracted from the exit mark. Default
+        0.65 (typical IB rate).
     """
 
     secret_key: str = "CHANGE-ME"
@@ -52,6 +59,15 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     claude_model: str = "claude-sonnet-4-6"
     data_dir: Path = Path("/app/data")
+
+    # Option P&L exit-friction model. When live bid/ask is unavailable
+    # (common on Greeks-only Massive tiers) the theoretical mid is
+    # haircut by half of ``option_spread_pct`` toward the side you must
+    # cross to close, and ``option_commission_per_contract`` is
+    # subtracted, so P&L reflects a realizable liquidation value rather
+    # than a frictionless mid.
+    option_spread_pct: float = 0.05
+    option_commission_per_contract: float = 0.65
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

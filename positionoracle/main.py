@@ -207,8 +207,12 @@ async def _on_trade(ticker: str, price: float) -> None:
 async def _init_position_greeks() -> None:
     """Sync the in-memory Greeks cache with the current positions list.
 
-    Adds placeholders for new positions and removes entries for positions
-    that no longer exist.
+    Adds placeholders for new positions, removes entries for positions
+    that no longer exist, and refreshes the ``position`` reference for
+    symbols that are still held so quantity / cost-basis changes (a
+    resized holding from a Flex sync or an API/MCP upsert) propagate to
+    the displayed and broadcast book. Live Greeks are preserved and
+    recomputed on the next snapshot tick.
     """
     current_symbols = {pos.symbol for pos in _positions}
 
@@ -217,15 +221,63 @@ async def _init_position_greeks() -> None:
         if symbol not in current_symbols:
             del _position_greeks[symbol]
 
-    # Add placeholders for new positions
     for pos in _positions:
-        if pos.symbol not in _position_greeks:
+        existing = _position_greeks.get(pos.symbol)
+        if existing is None:
             greeks = Greeks(delta=1.0) if pos.contract_type == ContractType.STOCK else Greeks()
             _position_greeks[pos.symbol] = PositionGreeks(
                 position=pos,
                 greeks=greeks,
                 underlying_price=_underlying_prices.get(pos.underlying, 0.0),
             )
+        else:
+            # Symbol still held but its quantity / cost basis may have
+            # changed; refresh the reference so the update is reflected.
+            existing.position = pos
+
+
+def _exit_value_per_share(pg: PositionGreeks) -> float | None:
+    """Estimated per-share liquidation value, net of exit friction.
+
+    Marks to the side of the book you have to cross to close: a long
+    exits at the bid, a short covers at the ask. When live quotes are
+    absent (common on Greeks-only Massive tiers) the theoretical mid is
+    haircut by a modeled half-spread (``option_spread_pct`` / 2) toward
+    that side instead. The per-contract exit commission is then applied
+    in the direction that reduces P&L.
+
+    This makes P&L reflect what a position could realistically be
+    closed for, rather than a frictionless mid that consistently reads
+    too favorable. Returns ``None`` when no mark is available.
+    """
+    pos = pg.position
+    half_spread = settings.option_spread_pct / 2.0
+    commission_ps = (
+        settings.option_commission_per_contract / pos.multiplier
+        if pos.multiplier
+        else 0.0
+    )
+
+    if pos.quantity < 0:
+        # Short: cover by lifting the ask (or mid + half-spread), then
+        # pay the exit commission — both raise the cost to close.
+        if pg.option_ask is not None:
+            base = pg.option_ask
+        elif pg.theoretical_mid is not None:
+            base = pg.theoretical_mid * (1.0 + half_spread)
+        else:
+            return None
+        return base + commission_ps
+
+    # Long: sell into the bid (or mid - half-spread), then pay the exit
+    # commission — both lower the proceeds. Floor at zero.
+    if pg.option_bid is not None:
+        base = pg.option_bid
+    elif pg.theoretical_mid is not None:
+        base = pg.theoretical_mid * (1.0 - half_spread)
+    else:
+        return None
+    return max(base - commission_ps, 0.0)
 
 
 def _apply_derived_metrics_to_position(pg: PositionGreeks) -> None:
@@ -289,13 +341,17 @@ def _apply_derived_metrics_to_position(pg: PositionGreeks) -> None:
     else:
         pg.theoretical_mid = None
 
-    # --- P&L% (direction-aware, anchored to entry premium) ---
+    # --- Exit mark + P&L% (direction-aware, anchored to entry premium) ---
+    # P&L is anchored to a friction-adjusted liquidation value, not the
+    # frictionless mid, so it reflects what the position could actually
+    # be closed for.
+    pg.exit_value = _exit_value_per_share(pg)
     if (
         entry
         and entry.entry_premium_per_share > 0
-        and pg.theoretical_mid is not None
+        and pg.exit_value is not None
     ):
-        current = pg.theoretical_mid
+        current = pg.exit_value
         entry_prem = entry.entry_premium_per_share
         if pos.quantity < 0:
             pg.pnl_pct = (entry_prem - current) / entry_prem
@@ -729,13 +785,16 @@ async def _refresh_options_snapshots() -> None:
             last_quote = snap.get("last_quote", {})
             bid = last_quote.get("bid", 0)
             ask = last_quote.get("ask", 0)
-            mid = (bid + ask) / 2 if bid and ask else None
+            has_quote = bool(bid and ask)
+            mid = (bid + ask) / 2 if has_quote else None
 
             _position_greeks[pos.symbol] = PositionGreeks(
                 position=pos,
                 greeks=greeks,
                 underlying_price=u_price,
                 option_mid=mid,
+                option_bid=bid if has_quote else None,
+                option_ask=ask if has_quote else None,
             )
 
             if u_price:
@@ -794,6 +853,7 @@ def _serialize_summaries(summaries: dict[str, Any]) -> dict[str, Any]:
                 "underlying_price": pg.underlying_price,
                 "option_mid": pg.option_mid,
                 "theoretical_mid": pg.theoretical_mid,
+                "exit_value": pg.exit_value,
                 "pnl_pct": pg.pnl_pct,
                 "greeks": dataclasses.asdict(pg.greeks),
                 "vrp": pg.vrp,
@@ -1305,7 +1365,11 @@ async def v1_create_position(
     body: CreatePositionRequest,
     _: None = Depends(_require_api_key),
 ) -> CreatedPositionResponse:
-    """Insert a position recorded outside the IB Flex pipeline.
+    """Insert or update a position recorded outside the IB Flex pipeline.
+
+    Upserts by symbol: submitting a symbol that already exists replaces
+    it in place, so this is also how you change a position's quantity
+    (e.g. scaling 100 shares to 200) between Flex syncs.
 
     Synchronously fetches the entry spot (Massive 1-min bar), entry
     risk-free rate (FRED), and back-solves entry IV via Black-Scholes
@@ -1353,13 +1417,11 @@ async def v1_create_position(
             body.underlying, expiration, contract_type, strike,
         )
 
-    # Reject duplicate symbols outright so the caller sees a clean 409
-    # rather than a silent overwrite.
-    if any(p.symbol == symbol for p in _positions):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Position with symbol {symbol!r} already exists",
-        )
+    # Upsert by symbol: if the position already exists (e.g. you scaled
+    # a holding from 100 to 200 shares), replace it in place rather than
+    # 409ing. This is the only API/MCP path to change a position's
+    # quantity between Flex syncs.
+    already_exists = any(p.symbol == symbol for p in _positions)
 
     entry_time = _ensure_entry_time_aware(body.entry_time)
     qty_sign = 1 if body.quantity > 0 else -1
@@ -1376,7 +1438,10 @@ async def v1_create_position(
         multiplier=multiplier,
     )
 
-    await db.upsert_positions(settings.data_dir, [*_positions, position])
+    # Drop any prior row for this symbol so we don't pass a duplicate to
+    # the upsert; the new ``position`` supersedes it.
+    others = [p for p in _positions if p.symbol != symbol]
+    await db.upsert_positions(settings.data_dir, [*others, position])
     await _reload_positions()
 
     entry_record: PositionEntry | None = None
@@ -1433,7 +1498,12 @@ async def v1_create_position(
     else:
         await _recompute_positions()
 
-    logger.info("Manual position created via API: %s qty=%d", symbol, body.quantity)
+    logger.info(
+        "Manual position %s via API: %s qty=%d",
+        "updated" if already_exists else "created",
+        symbol,
+        body.quantity,
+    )
     return CreatedPositionResponse(
         symbol=symbol,
         underlying=position.underlying,

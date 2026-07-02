@@ -393,16 +393,19 @@ class TestV1CreatePositionInsert:
         assert body["contract_type"] == "stock"
         assert body["entry_iv"] is None
 
-    async def test_duplicate_symbol_returns_409(self, client, auth_cookie):
+    async def test_duplicate_symbol_upserts_quantity(self, client, auth_cookie):
+        """Re-submitting an existing symbol updates it in place (no 409).
+
+        This is the only API/MCP path to scale a position's quantity
+        (e.g. 100 -> 200 shares) between Flex syncs.
+        """
         bearer = await _make_bearer(client, auth_cookie)
         payload = {
             "underlying": "AAPL",
-            "contract_type": "put",
-            "quantity": -1,
+            "contract_type": "stock",
+            "quantity": 100,
             "entry_time": "2099-06-02T14:30:00-04:00",
-            "entry_premium_per_share": 2.0,
-            "strike": 95.0,
-            "expiration": "2099-12-19",
+            "entry_premium_per_share": 150.0,
         }
         first = await client.post(
             "/api/v1/positions",
@@ -410,12 +413,29 @@ class TestV1CreatePositionInsert:
             headers={"Authorization": f"Bearer {bearer}"},
         )
         assert first.status_code == 201
+        assert first.json()["quantity"] == 100
+
         second = await client.post(
             "/api/v1/positions",
-            json=payload,
+            json={**payload, "quantity": 200},
             headers={"Authorization": f"Bearer {bearer}"},
         )
-        assert second.status_code == 409
+        assert second.status_code == 201
+        assert second.json()["quantity"] == 200
+
+        # The book should hold a single AAPL row at the new quantity,
+        # not two.
+        listing = await client.get(
+            "/api/v1/positions",
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        aapl = listing.json()["underlyings"]["AAPL"]
+        stock_qty = sum(
+            p["quantity"]
+            for p in aapl["positions"]
+            if p["contract_type"] == "stock"
+        )
+        assert stock_qty == 200
 
     async def test_position_appears_in_get_positions(self, client, auth_cookie):
         bearer = await _make_bearer(client, auth_cookie)
