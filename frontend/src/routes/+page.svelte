@@ -450,6 +450,7 @@
 
 	onMount(async () => {
 		window.addEventListener('po:unauthorized', handleUnauthorized);
+		document.addEventListener('visibilitychange', handleVisibilityChange);
 		try {
 			const status = await getAuthStatus();
 			authenticated = status.authenticated;
@@ -473,8 +474,25 @@
 
 	onDestroy(() => {
 		window.removeEventListener('po:unauthorized', handleUnauthorized);
+		document.removeEventListener('visibilitychange', handleVisibilityChange);
 		ws?.disconnect();
 	});
+
+	// Pause the live stream while the tab is backgrounded. Otherwise the
+	// browser throttles rendering and the intervening snapshot ticks
+	// (and their chart transitions) queue up and replay in a burst on
+	// return — which also balloons memory. On refocus we reconnect; the
+	// server sends the current snapshot on connect, so we jump straight
+	// to "now" instead of replaying history.
+	function handleVisibilityChange() {
+		if (!authenticated || !ws) return;
+		if (document.hidden) {
+			ws.disconnect();
+			connected = false;
+		} else if (!ws.connected) {
+			ws.connect();
+		}
+	}
 
 	function startWebSocket() {
 		ws = new PortfolioWebSocket();

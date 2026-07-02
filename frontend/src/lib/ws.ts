@@ -101,6 +101,9 @@ export class PortfolioWebSocket {
 	private handlers: Set<MessageHandler> = new Set();
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private _connected = false;
+	// Set when the caller deliberately closes (e.g. the tab was
+	// backgrounded) so ``onclose`` doesn't schedule an auto-reconnect.
+	private intentionalClose = false;
 
 	get connected(): boolean {
 		return this._connected;
@@ -108,6 +111,7 @@ export class PortfolioWebSocket {
 
 	connect(): void {
 		if (this.ws) return;
+		this.intentionalClose = false;
 
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 		const url = `${protocol}//${window.location.host}/api/ws`;
@@ -133,6 +137,10 @@ export class PortfolioWebSocket {
 		this.ws.onclose = () => {
 			this._connected = false;
 			this.ws = null;
+			if (this.intentionalClose) {
+				console.log('WebSocket closed (intentional); not reconnecting');
+				return;
+			}
 			console.log('WebSocket disconnected, reconnecting in 3s...');
 			this.reconnectTimer = setTimeout(() => this.connect(), 3000);
 		};
@@ -143,6 +151,7 @@ export class PortfolioWebSocket {
 	}
 
 	disconnect(): void {
+		this.intentionalClose = true;
 		if (this.reconnectTimer) {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
