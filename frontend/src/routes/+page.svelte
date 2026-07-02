@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout, refreshGex, getBlacklist, listApiKeys, createApiKey, deleteApiKey, listOAuthClients, createOAuthClient, deleteOAuthClient, updateOAuthClientRedirectUris, type BlacklistEntry, type ApiKeyListItem, type ApiKeyCreated, type OAuthClientItem, type OAuthClientCreated } from '$lib/api';
+	import { getAuthStatus, importPositions, fetchPositionsFromIB, analyzeSymbol, logout, refreshGex, getBlacklist, listApiKeys, createApiKey, deleteApiKey, listOAuthClients, createOAuthClient, deleteOAuthClient, updateOAuthClientRedirectUris, priceOption, type BlacklistEntry, type ApiKeyListItem, type ApiKeyCreated, type OAuthClientItem, type OAuthClientCreated, type PriceOptionResponse } from '$lib/api';
 	import { PortfolioWebSocket, type PortfolioUpdate, type PortfolioRollup, type UnderlyingSummary, type GEXProfile } from '$lib/ws';
 	import { evaluateAll, evaluateNetDelta, evaluateNetTheta, evaluateNetVega, evaluateNetGamma, evaluateBetaWeightedDelta, signalClass } from '$lib/greek-signals';
 	import { tooltip } from '$lib/tooltip';
@@ -174,13 +174,13 @@
 		}
 	}
 
-	type Tab = 'greeks' | 'washsale' | 'apikeys';
+	type Tab = 'greeks' | 'planner' | 'washsale' | 'apikeys';
 	const TAB_KEY = 'po_active_tab';
 
 	function loadActiveTab(): Tab {
 		try {
 			const raw = localStorage.getItem(TAB_KEY);
-			if (raw === 'greeks' || raw === 'washsale' || raw === 'apikeys') return raw;
+			if (raw === 'greeks' || raw === 'planner' || raw === 'washsale' || raw === 'apikeys') return raw;
 		} catch {
 			// ignore
 		}
@@ -200,6 +200,46 @@
 			loadBlacklist();
 		} else if (tab === 'apikeys') {
 			loadApiKeys();
+		}
+	}
+
+	// --- Trade planner (VRP=1.0 pricing) ---
+	let plannerUnderlying = $state('');
+	let plannerType = $state<'call' | 'put'>('put');
+	let plannerDirection = $state<'long' | 'short'>('short');
+	let plannerStrike = $state<number | null>(null);
+	let plannerExpiration = $state('');
+	let plannerResult = $state<PriceOptionResponse | null>(null);
+	let plannerLoading = $state(false);
+	let plannerError = $state<string | null>(null);
+
+	async function handlePriceOption(e: Event) {
+		e.preventDefault();
+		if (!plannerUnderlying.trim() || !plannerStrike || !plannerExpiration) return;
+		plannerLoading = true;
+		plannerError = null;
+		try {
+			plannerResult = await priceOption({
+				underlying: plannerUnderlying.trim().toUpperCase(),
+				contract_type: plannerType,
+				direction: plannerDirection,
+				strike: plannerStrike,
+				expiration: plannerExpiration
+			});
+		} catch (err) {
+			plannerError = err instanceof Error ? err.message : String(err);
+			plannerResult = null;
+		} finally {
+			plannerLoading = false;
+		}
+	}
+
+	function vrpSignalClass(signal: string): string {
+		switch (signal) {
+			case 'favorable': return 'sig-favorable';
+			case 'unfavorable': return 'sig-unfavorable';
+			case 'neutral': return 'sig-neutral';
+			default: return 'sig-na';
 		}
 	}
 
@@ -863,6 +903,15 @@
 		</button>
 		<button
 			class="tab"
+			class:tab-active={activeTab === 'planner'}
+			role="tab"
+			aria-selected={activeTab === 'planner'}
+			onclick={() => setActiveTab('planner')}
+		>
+			Planner
+		</button>
+		<button
+			class="tab"
 			class:tab-active={activeTab === 'washsale'}
 			role="tab"
 			aria-selected={activeTab === 'washsale'}
@@ -1127,6 +1176,100 @@
 					onclick={openUploadDialog}
 				>Upload new report</button>
 			</div>
+		{/if}
+	</main>
+	{:else if activeTab === 'planner'}
+	<main class="planner">
+		<div class="planner-header">
+			<h2>Trade Planner — VRP = 1.0 pricing</h2>
+			<p class="muted">
+				The price at which implied vol would equal the underlying's trailing realized
+				vol. A <strong>short</strong> aims to collect ≥ this; a <strong>long</strong> aims
+				to pay ≤ this.
+			</p>
+		</div>
+
+		<form class="planner-form" onsubmit={handlePriceOption}>
+			<label>
+				<span>Underlying</span>
+				<input type="text" bind:value={plannerUnderlying} placeholder="AAPL" required />
+			</label>
+			<label>
+				<span>Type</span>
+				<select bind:value={plannerType}>
+					<option value="put">Put</option>
+					<option value="call">Call</option>
+				</select>
+			</label>
+			<label>
+				<span>Direction</span>
+				<select bind:value={plannerDirection}>
+					<option value="short">Short (sell)</option>
+					<option value="long">Long (buy)</option>
+				</select>
+			</label>
+			<label>
+				<span>Strike</span>
+				<input type="number" step="0.5" min="0" bind:value={plannerStrike} placeholder="150" required />
+			</label>
+			<label>
+				<span>Expiration</span>
+				<input type="date" bind:value={plannerExpiration} required />
+			</label>
+			<button type="submit" class="planner-submit" disabled={plannerLoading}>
+				{plannerLoading ? 'Pricing…' : 'Price it'}
+			</button>
+		</form>
+
+		{#if plannerError}
+			<p class="planner-error">{plannerError}</p>
+		{/if}
+
+		{#if plannerResult}
+			{@const r = plannerResult}
+			<div class="planner-summary">
+				<span><strong>{r.underlying}</strong> {r.contract_type.toUpperCase()} · {r.direction}</span>
+				<span>Spot ${r.spot.toFixed(2)}</span>
+				<span>RV {(r.rv * 100).toFixed(1)}% ({r.rv_window_days}d)</span>
+				<span>DTE {r.dte_days}</span>
+				<span>Rate {(r.rate * 100).toFixed(2)}%</span>
+			</div>
+
+			<div class="planner-entered {vrpSignalClass(r.entered.signal)}">
+				<div class="entered-price">
+					<span class="entered-label">VRP=1.0 fair</span>
+					<span class="entered-value">${r.entered.fair_price.toFixed(2)}</span>
+					<span class="entered-sub">${r.entered.fair_price_contract.toFixed(0)} / contract</span>
+				</div>
+				<p class="entered-verdict">{r.entered.verdict}</p>
+			</div>
+
+			{#if r.scan.length > 1}
+				<table class="planner-scan">
+					<thead>
+						<tr>
+							<th>Strike</th>
+							<th>Fair</th>
+							<th>Live mid</th>
+							<th>IV</th>
+							<th>VRP</th>
+							<th>Signal</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each r.scan as q}
+							<tr class:scan-entered={q.is_entered}>
+								<td>{q.strike.toFixed(1)}{q.is_entered ? ' ◄' : ''}</td>
+								<td>${q.fair_price.toFixed(2)}</td>
+								<td>{q.live_mid != null ? `$${q.live_mid.toFixed(2)}` : '—'}</td>
+								<td>{q.live_iv != null ? `${(q.live_iv * 100).toFixed(0)}%` : '—'}</td>
+								<td>{q.current_vrp != null ? q.current_vrp.toFixed(2) : '—'}</td>
+								<td><span class="sig-badge {vrpSignalClass(q.signal)}">{q.signal}</span></td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			{/if}
 		{/if}
 	</main>
 	{:else if activeTab === 'washsale'}
@@ -2777,4 +2920,126 @@
 		color: #f87171;
 		font-weight: 600;
 	}
+
+	/* --- Trade planner --- */
+	.planner {
+		max-width: 900px;
+		margin: 0 auto;
+		padding: 1.5rem;
+	}
+
+	.planner-header h2 {
+		margin: 0 0 0.25rem;
+	}
+
+	.planner-form {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: flex-end;
+		gap: 0.75rem;
+		margin: 1.25rem 0;
+	}
+
+	.planner-form label {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		font-size: 0.8rem;
+		color: #94a3b8;
+	}
+
+	.planner-form input,
+	.planner-form select {
+		background: #0f172a;
+		border: 1px solid #334155;
+		border-radius: 6px;
+		color: #e2e8f0;
+		padding: 0.5rem 0.6rem;
+		font-size: 0.9rem;
+	}
+
+	.planner-form input[type='text'] { width: 6rem; text-transform: uppercase; }
+	.planner-form input[type='number'] { width: 6rem; }
+
+	.planner-submit {
+		background: #2563eb;
+		border: none;
+		border-radius: 6px;
+		color: white;
+		padding: 0.55rem 1.1rem;
+		font-size: 0.9rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.planner-submit:disabled { opacity: 0.6; cursor: default; }
+
+	.planner-error {
+		color: #f87171;
+		font-size: 0.875rem;
+	}
+
+	.planner-summary {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 1.25rem;
+		font-size: 0.85rem;
+		color: #cbd5e1;
+		padding: 0.75rem 0;
+		border-top: 1px solid #1e293b;
+	}
+
+	.planner-entered {
+		display: flex;
+		align-items: center;
+		gap: 1.5rem;
+		padding: 1rem 1.25rem;
+		border-radius: 8px;
+		border-left: 4px solid #475569;
+		background: #1e293b;
+		margin: 0.5rem 0 1.25rem;
+	}
+
+	.entered-price {
+		display: flex;
+		flex-direction: column;
+		line-height: 1.2;
+		white-space: nowrap;
+	}
+	.entered-label { font-size: 0.7rem; text-transform: uppercase; color: #94a3b8; }
+	.entered-value { font-size: 1.75rem; font-weight: 700; }
+	.entered-sub { font-size: 0.75rem; color: #94a3b8; }
+	.entered-verdict { margin: 0; font-size: 0.9rem; color: #e2e8f0; }
+
+	.planner-scan {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 0.85rem;
+	}
+	.planner-scan th, .planner-scan td {
+		text-align: right;
+		padding: 0.4rem 0.6rem;
+		border-bottom: 1px solid #1e293b;
+	}
+	.planner-scan th:first-child, .planner-scan td:first-child { text-align: left; }
+	.planner-scan th { color: #94a3b8; font-weight: 600; }
+	.scan-entered { background: #1e293b; font-weight: 600; }
+
+	.sig-badge {
+		display: inline-block;
+		padding: 0.1rem 0.5rem;
+		border-radius: 999px;
+		font-size: 0.7rem;
+		text-transform: capitalize;
+	}
+
+	/* Signal colours — border-left on the entered card, text/badge elsewhere. */
+	.planner-entered.sig-favorable { border-left-color: #22c55e; }
+	.planner-entered.sig-unfavorable { border-left-color: #ef4444; }
+	.planner-entered.sig-neutral { border-left-color: #eab308; }
+	.planner-entered.sig-na { border-left-color: #475569; }
+
+	.sig-badge.sig-favorable { background: #14532d; color: #86efac; }
+	.sig-badge.sig-unfavorable { background: #7f1d1d; color: #fca5a5; }
+	.sig-badge.sig-neutral { background: #713f12; color: #fde68a; }
+	.sig-badge.sig-na { background: #334155; color: #cbd5e1; }
 </style>

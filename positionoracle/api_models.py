@@ -308,3 +308,89 @@ class CreatedPositionResponse(BaseModel):
     entry_premium_per_share: float | None = None
     entry_iv: float | None = None
     entry_rate: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Trade planner (VRP=1.0 pricing)
+# ---------------------------------------------------------------------------
+
+
+class PriceOptionRequest(BaseModel):
+    """Body for the VRP=1.0 trade planner."""
+
+    underlying: str = Field(
+        ...,
+        min_length=1,
+        max_length=10,
+        description="Underlying ticker, e.g. ``AAPL``.",
+    )
+    contract_type: str = Field(
+        ...,
+        pattern="^(call|put)$",
+        description="``call`` or ``put``.",
+    )
+    direction: str = Field(
+        ...,
+        pattern="^(long|short)$",
+        description="``long`` (buying) or ``short`` (selling) — sets which "
+        "side the fair price is a bound for.",
+    )
+    strike: float = Field(..., gt=0, description="Contract strike.")
+    expiration: datetime.date = Field(
+        ...,
+        description="Contract expiration (ISO ``YYYY-MM-DD``). Must be today "
+        "or later.",
+    )
+
+
+class VrpQuoteModel(BaseModel):
+    """A VRP=1.0 fair price for one strike, with optional live context."""
+
+    strike: float
+    fair_price: float = Field(
+        ..., description="VRP=1.0 (IV == RV) Black-Scholes price, per share.",
+    )
+    fair_price_contract: float = Field(
+        ..., description="Per-contract dollars (fair_price x multiplier).",
+    )
+    live_iv: float | None = Field(
+        None, description="Current market implied vol, if a snapshot was found.",
+    )
+    live_mid: float | None = Field(
+        None, description="Current market mid per share, if quotes were found.",
+    )
+    current_vrp: float | None = Field(
+        None, description="RV / live_iv — the VRP the market is currently "
+        "offering. Null when no live IV was available.",
+    )
+    signal: str = Field(
+        ...,
+        description="``favorable`` / ``neutral`` / ``unfavorable`` for the "
+        "requested direction, or ``na`` without a live IV.",
+    )
+    verdict: str
+    is_entered: bool = Field(
+        False, description="True for the strike the caller asked about.",
+    )
+
+
+class PriceOptionResponse(BaseModel):
+    """Response for the VRP=1.0 trade planner."""
+
+    underlying: str
+    contract_type: str
+    direction: str
+    expiration: str
+    spot: float
+    rv: float = Field(..., description="Trailing annualized realized vol used "
+        "as the VRP=1.0 sigma.")
+    rv_window_days: int
+    dte_days: int
+    rate: float
+    multiplier: int
+    entered: VrpQuoteModel = Field(..., description="The requested contract.")
+    scan: list[VrpQuoteModel] = Field(
+        default_factory=list,
+        description="The requested strike plus nearby listed strikes, sorted "
+        "ascending. Empty when no live chain was available.",
+    )

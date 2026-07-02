@@ -44,6 +44,7 @@ from positionoracle import (
     massive,
     mcp_server,
     oauth,
+    planner,
     vrp,
 )
 from positionoracle.advisor import build_portfolio_summary
@@ -55,6 +56,9 @@ from positionoracle.api_models import (
     CreatedPositionResponse,
     CreatePositionRequest,
     PositionsResponse,
+    PriceOptionRequest,
+    PriceOptionResponse,
+    VrpQuoteModel,
     WashsaleResponse,
 )
 from positionoracle.config import Settings, get_settings
@@ -1345,6 +1349,197 @@ def _synthesize_option_symbol(
     put_call = "C" if contract_type == ContractType.CALL else "P"
     strike_int = round(strike * 1000)
     return f"{underlying_padded}{expiry_str}{put_call}{strike_int:08d}"
+
+
+# ---------------------------------------------------------------------------
+# Trade planner (VRP=1.0 pricing)
+# ---------------------------------------------------------------------------
+
+# Number of nearby listed strikes to include on each side of the request.
+_SCAN_RADIUS = 3
+
+
+def _mid_from_quote(quote: dict[str, Any]) -> float | None:
+    """Return the bid/ask mid from a Massive ``last_quote`` dict, or None."""
+    bid = quote.get("bid", 0) or 0
+    ask = quote.get("ask", 0) or 0
+    if bid and ask:
+        return (bid + ask) / 2.0
+    return None
+
+
+async def _compute_price_plan(body: PriceOptionRequest) -> PriceOptionResponse:
+    """Compute VRP=1.0 fair prices for a hypothetical option trade.
+
+    Pulls the underlying's trailing realized vol, current spot, and the
+    risk-free rate, then prices the requested strike (plus a few nearby
+    listed strikes) at ``sigma = RV``. When a live options-chain snapshot
+    is available each quote is enriched with the current IV / mid and a
+    direction-aware verdict.
+    """
+    global http_client
+
+    if not settings.massive_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Massive API key not configured; cannot price trades.",
+        )
+
+    underlying = body.underlying.upper()
+    contract_type = (
+        ContractType.CALL if body.contract_type == "call" else ContractType.PUT
+    )
+    today = datetime.date.today()
+    if body.expiration < today:
+        raise HTTPException(
+            status_code=400, detail="expiration must be today or later.",
+        )
+    dte_days = max((body.expiration - today).days, 1)
+
+    if http_client is None:
+        http_client = httpx.AsyncClient(timeout=30)
+
+    # --- Trailing realized vol (the VRP=1.0 sigma) ---
+    bars = await massive.get_daily_bars(
+        settings.massive_api_key, underlying, days=45, client=http_client,
+    )
+    closes = [float(b["c"]) for b in bars if b.get("c")]
+    rv = vrp.realized_vol_annualized(closes, window=vrp.DEFAULT_RV_WINDOW)
+    if rv != rv or rv <= 0:  # NaN or non-positive
+        raise HTTPException(
+            status_code=502,
+            detail=f"Insufficient price history to compute realized vol for "
+            f"{underlying}.",
+        )
+    rv_window_days = min(len(closes) - 1, vrp.DEFAULT_RV_WINDOW)
+
+    # --- Risk-free rate for the horizon (fall back to 5% if FRED is down) ---
+    rate = await fred.get_rate_for_dte(
+        settings.fred_api_key, settings.data_dir, dte_days, client=http_client,
+    )
+    if rate is None or rate != rate:
+        rate = 0.05
+
+    # --- Live chain around the requested strike ---
+    exp_iso = body.expiration.isoformat()
+    try:
+        chain = await massive.get_options_chain_snapshot(
+            settings.massive_api_key,
+            underlying,
+            strike_gte=body.strike * 0.85,
+            strike_lte=body.strike * 1.15,
+            expiration_lte=exp_iso,
+            client=http_client,
+        )
+    except Exception:
+        logger.exception("Planner: chain snapshot failed for %s", underlying)
+        chain = []
+
+    # Index live IV / mid by strike for the requested expiration + type.
+    live_by_strike: dict[float, dict[str, float | None]] = {}
+    spot: float | None = None
+    for c in chain:
+        details = c.get("details", {})
+        if details.get("expiration_date") != exp_iso:
+            continue
+        if details.get("contract_type", "").lower() != contract_type.value:
+            continue
+        k = details.get("strike_price")
+        if not k:
+            continue
+        if spot is None:
+            spot = (c.get("underlying_asset") or {}).get("price")
+        iv = c.get("implied_volatility")
+        live_by_strike[float(k)] = {
+            "iv": float(iv) if iv else None,
+            "mid": _mid_from_quote(c.get("last_quote") or {}),
+        }
+
+    # Spot fallback: chain -> stock snapshot -> last daily close.
+    if not spot or spot <= 0:
+        snap = await massive.get_stock_snapshot(
+            settings.massive_api_key, underlying, client=http_client,
+        )
+        if snap:
+            day = snap.get("day") or {}
+            prev = snap.get("prevDay") or {}
+            spot = day.get("c") or prev.get("c")
+    if not spot or spot <= 0:
+        spot = closes[-1] if closes else None
+    if not spot or spot <= 0:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not resolve a spot price for {underlying}.",
+        )
+
+    # --- Choose strikes to price: nearest listed to the request, plus a
+    # few on each side. Fall back to just the requested strike (fair-only)
+    # when the chain came back empty. ---
+    listed = sorted(live_by_strike)
+    if listed:
+        nearest = min(listed, key=lambda k: abs(k - body.strike))
+        idx = listed.index(nearest)
+        lo = max(0, idx - _SCAN_RADIUS)
+        hi = min(len(listed), idx + _SCAN_RADIUS + 1)
+        scan_strikes = listed[lo:hi]
+        entered_strike = nearest
+    else:
+        scan_strikes = [body.strike]
+        entered_strike = body.strike
+
+    def _quote(strike: float) -> VrpQuoteModel:
+        live = live_by_strike.get(strike, {})
+        q = planner.price_quote(
+            spot=spot,
+            strike=strike,
+            dte_days=dte_days,
+            rate=rate,
+            rv=rv,
+            contract_type=contract_type,
+            direction=body.direction,
+            live_iv=live.get("iv"),
+            live_mid=live.get("mid"),
+        )
+        return VrpQuoteModel(
+            strike=q.strike,
+            fair_price=q.fair_price,
+            fair_price_contract=q.fair_price_contract,
+            live_iv=q.live_iv,
+            live_mid=q.live_mid,
+            current_vrp=q.current_vrp,
+            signal=q.signal,
+            verdict=q.verdict,
+            is_entered=strike == entered_strike,
+        )
+
+    scan = [_quote(k) for k in scan_strikes]
+    entered = next(
+        (q for q in scan if q.is_entered), None,
+    ) or _quote(entered_strike)
+
+    return PriceOptionResponse(
+        underlying=underlying,
+        contract_type=contract_type.value,
+        direction=body.direction,
+        expiration=exp_iso,
+        spot=spot,
+        rv=rv,
+        rv_window_days=rv_window_days,
+        dte_days=dte_days,
+        rate=rate,
+        multiplier=100,
+        entered=entered,
+        scan=scan,
+    )
+
+
+@app.post("/api/price", response_model=PriceOptionResponse)
+async def price_option_route(
+    body: PriceOptionRequest, request: Request,
+) -> PriceOptionResponse:
+    """VRP=1.0 trade planner (in-app, cookie-authenticated)."""
+    _require_auth(request)
+    return await _compute_price_plan(body)
 
 
 def _ensure_entry_time_aware(entry_time: datetime.datetime) -> datetime.datetime:

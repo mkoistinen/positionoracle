@@ -482,6 +482,57 @@ async def create_position(
 
 
 @mcp.tool()
+async def price_option(
+    underlying: str,
+    contract_type: str,
+    direction: str,
+    strike: float,
+    expiration: str,
+) -> dict[str, Any]:
+    """Price an option at VRP=1.0 to plan a trade before entering it.
+
+    Returns the Black-Scholes price at which implied vol would equal the
+    underlying's trailing realized vol (VRP == 1.0) — the fair-value
+    anchor. A ``short`` should aim to collect at least this; a ``long``
+    should aim to pay no more than this. When a live options chain is
+    available each strike also carries the current IV, mid, VRP, and a
+    direction-aware verdict, plus a few nearby strikes for comparison.
+
+    Parameters
+    ----------
+    underlying : str
+        Underlying ticker, e.g. ``"AAPL"``.
+    contract_type : str
+        ``"call"`` or ``"put"``.
+    direction : str
+        ``"long"`` (buying) or ``"short"`` (selling).
+    strike : float
+        Contract strike.
+    expiration : str
+        ISO date (``YYYY-MM-DD``). Must be today or later.
+    """
+    from fastapi import HTTPException
+
+    from positionoracle import main as app_main
+    from positionoracle.api_models import PriceOptionRequest
+
+    body = PriceOptionRequest(
+        underlying=underlying,
+        contract_type=contract_type,
+        direction=direction,
+        strike=strike,
+        expiration=_parse_iso_date(expiration),
+    )
+
+    try:
+        response = await app_main._compute_price_plan(body)
+    except HTTPException as exc:
+        raise ValueError(f"{exc.status_code}: {exc.detail}") from exc
+
+    return response.model_dump(mode="json")
+
+
+@mcp.tool()
 async def close_position(symbol: str) -> dict[str, str]:
     """Close (delete) a position by its exact symbol.
 

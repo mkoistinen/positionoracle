@@ -103,6 +103,53 @@ export async function getBlacklist(): Promise<BlacklistResponse> {
 }
 
 // ---------------------------------------------------------------------------
+// Trade planner (VRP=1.0 pricing)
+// ---------------------------------------------------------------------------
+
+export interface PriceOptionRequest {
+	underlying: string;
+	contract_type: 'call' | 'put';
+	direction: 'long' | 'short';
+	strike: number;
+	expiration: string; // YYYY-MM-DD
+}
+
+export interface VrpQuote {
+	strike: number;
+	fair_price: number;
+	fair_price_contract: number;
+	live_iv: number | null;
+	live_mid: number | null;
+	current_vrp: number | null;
+	signal: 'favorable' | 'neutral' | 'unfavorable' | 'na';
+	verdict: string;
+	is_entered: boolean;
+}
+
+export interface PriceOptionResponse {
+	underlying: string;
+	contract_type: string;
+	direction: string;
+	expiration: string;
+	spot: number;
+	rv: number;
+	rv_window_days: number;
+	dte_days: number;
+	rate: number;
+	multiplier: number;
+	entered: VrpQuote;
+	scan: VrpQuote[];
+}
+
+export async function priceOption(body: PriceOptionRequest): Promise<PriceOptionResponse> {
+	return fetchJson('/api/price', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+}
+
+// ---------------------------------------------------------------------------
 // API key management
 // ---------------------------------------------------------------------------
 
